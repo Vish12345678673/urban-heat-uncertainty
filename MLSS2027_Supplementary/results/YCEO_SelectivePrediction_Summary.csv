@@ -1,0 +1,8 @@
+Metric,Value
+Full_Coverage_MAE,0.47701163680058944
+80pct_Coverage_OOD_MAE,0.44039649875304815
+80pct_Coverage_Raw_Uncertainty_MAE,0.4230970793017592
+80pct_Coverage_Calibrated_Uncertainty_MAE,0.42329777826120646
+50pct_Coverage_OOD_MAE,0.40756678451415174
+50pct_Coverage_Raw_Uncertainty_MAE,0.38323982633976533
+50pct_Coverage_Calibrated_Uncertainty_MAE,0.38349479690400395

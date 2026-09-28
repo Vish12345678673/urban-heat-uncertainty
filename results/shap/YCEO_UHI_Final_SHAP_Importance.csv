@@ -1,0 +1,10 @@
+Feature,Mean_Absolute_SHAP
+NDVI,0.15691148
+Mean_Monthly_Precip_mm,0.1519212
+Mean_Temp_C,0.12148875
+Builtup,0.08522817
+Urban_LC_Fraction,0.07028285
+Elevation,0.06634832
+Vegetation_LC_Fraction,0.046910938
+Water_LC_Fraction,0.04391066
+Population,0.029144442

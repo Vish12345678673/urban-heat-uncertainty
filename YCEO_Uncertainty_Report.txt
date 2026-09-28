@@ -1,0 +1,22 @@
+
+UNCERTAINTY-AWARE XGBOOST SUMMARY
+
+Five-fold spatial CV:
+R2   = 0.381290 ± 0.082030
+RMSE = 0.650130 ± 0.022128
+MAE  = 0.477012 ± 0.013569
+
+95% interval coverage:
+91.992%
+
+Uncertainty-error Pearson correlation:
+0.292531
+
+Uncertainty-error Spearman correlation:
+0.231471
+
+Q4/Q1 uncertainty-based MAE degradation:
+88.0566%
+
+Highest-uncertainty 20% share of total absolute error:
+28.811%

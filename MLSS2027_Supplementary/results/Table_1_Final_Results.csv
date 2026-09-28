@@ -1,0 +1,22 @@
+Result,Value
+Number of original YCEO clusters,10136
+Final modeling observations,9790
+Number of predictors,9
+Spatial blocks,182
+Spatial CV folds,5
+Mean spatial R²,0.3812898821831249
+SD of spatial R²,0.08203042473368032
+Mean spatial RMSE,0.6501302787697614
+SD of spatial RMSE,0.02212756003449841
+Mean spatial MAE,0.4770116368005895
+SD of spatial MAE,0.013569178968958156
+Single holdout R²,0.382648
+Single holdout RMSE,0.614984
+Single holdout MAE,0.450956
+Moran's I (k=8),0.2078383954414909
+Moran's I p-value,0.001
+Top SHAP predictor,NDVI
+Second SHAP predictor,Mean_Monthly_Precip_mm
+Third SHAP predictor,Mean_Temp_C
+Fourth SHAP predictor,Builtup
+Fifth SHAP predictor,Urban_LC_Fraction

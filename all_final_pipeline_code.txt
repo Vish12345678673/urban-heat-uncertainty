@@ -1,0 +1,9835 @@
+============================================================
+FILE: .\code\utils\paths.py
+============================================================
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+DATA_DIR = PROJECT_ROOT / "data"
+
+RESULTS_DIR = PROJECT_ROOT / "results"
+
+FINAL_RESULTS_DIR = RESULTS_DIR / "final_paper"
+
+UNCERTAINTY_RESULTS_DIR = RESULTS_DIR / "uncertainty"
+
+OOD_RESULTS_DIR = RESULTS_DIR / "ood"
+
+METRICS_RESULTS_DIR = RESULTS_DIR / "metrics"
+
+for directory in [
+    RESULTS_DIR,
+    FINAL_RESULTS_DIR,
+    UNCERTAINTY_RESULTS_DIR,
+    OOD_RESULTS_DIR,
+    METRICS_RESULTS_DIR,
+]:
+    directory.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+============================================================
+FILE: .\code\uncertainty\uncertainty_aware_xgboost.py
+============================================================
+import os
+import random
+
+import numpy as np
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(
+    __file__
+).resolve().parents[2]
+
+sys.path.insert(
+    0,
+    str(PROJECT_ROOT / "code")
+)
+
+from utils.paths import (
+    DATA_DIR,
+    UNCERTAINTY_RESULTS_DIR
+)
+import pandas as pd
+
+from sklearn.model_selection import (
+    GroupKFold,
+    GroupShuffleSplit
+)
+
+from sklearn.metrics import (
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error
+)
+
+from xgboost import XGBRegressor
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DATA_FILE = (
+    DATA_DIR
+    / "YCEO_UHI_Enhanced_ML_Clean_Daytime.csv"
+)
+
+RANDOM_STATE = 42
+
+N_OUTER_FOLDS = 5
+
+N_INTERNAL_FOLDS = 4
+
+INTERNAL_VAL_SIZE = 0.15
+
+FEATURES = [
+    "NDVI",
+    "Elevation",
+    "Builtup",
+    "Population",
+    "Mean_Temp_C",
+    "Mean_Monthly_Precip_mm",
+    "Urban_LC_Fraction",
+    "Water_LC_Fraction",
+    "Vegetation_LC_Fraction"
+]
+
+TARGET = "Annual_day"
+
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+os.environ["PYTHONHASHSEED"] = str(
+    RANDOM_STATE
+)
+
+random.seed(
+    RANDOM_STATE
+)
+
+np.random.seed(
+    RANDOM_STATE
+)
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+df = pd.read_csv(
+    DATA_FILE
+)
+
+df = df.dropna(
+    subset=FEATURES + [
+        TARGET,
+        "Lat",
+        "Lon"
+    ]
+).copy()
+
+df = df[
+    df["Population"] >= 0
+].copy()
+
+df = df[
+    (df["NDVI"] >= -1) &
+    (df["NDVI"] <= 1)
+].copy()
+
+
+# ============================================================
+# SPATIAL BLOCKS
+# ============================================================
+
+df["lat_block"] = np.floor(
+    df["Lat"] / 10
+).astype(int)
+
+df["lon_block"] = np.floor(
+    df["Lon"] / 10
+).astype(int)
+
+df["spatial_block"] = (
+    df["lat_block"].astype(str)
+    + "_"
+    + df["lon_block"].astype(str)
+)
+
+
+X = df[FEATURES].copy()
+
+y = df[TARGET].copy()
+
+groups = df["spatial_block"].copy()
+
+
+print()
+print("============================================================")
+print("UNCERTAINTY-AWARE XGBOOST")
+print("============================================================")
+
+print(
+    "Dataset:",
+    df.shape
+)
+
+print(
+    "Features:",
+    len(FEATURES)
+)
+
+print(
+    "Spatial blocks:",
+    groups.nunique()
+)
+
+
+# ============================================================
+# MODEL FACTORY
+# ============================================================
+
+def make_model(
+    seed=RANDOM_STATE
+):
+
+    return XGBRegressor(
+
+        n_estimators=500,
+
+        learning_rate=0.03,
+
+        max_depth=6,
+
+        min_child_weight=5,
+
+        subsample=0.8,
+
+        colsample_bytree=0.9,
+
+        reg_lambda=1.0,
+
+        objective="reg:squarederror",
+
+        eval_metric="rmse",
+
+        random_state=seed,
+
+        n_jobs=-1,
+
+        tree_method="hist"
+    )
+
+
+# ============================================================
+# LEAKAGE-FREE OOF RESIDUALS
+# ============================================================
+#
+# The variance model must NOT be trained on residuals obtained
+# from predictions made by a model trained on the same samples.
+#
+# Therefore, within each OUTER TRAINING SET:
+#
+#   inner spatial folds
+#       ↓
+#   OOF mean prediction
+#       ↓
+#   squared residual
+#
+# These OOF squared residuals become the target for the
+# uncertainty model.
+# ============================================================
+
+def build_oof_residual_targets(
+    X_train,
+    y_train,
+    groups_train
+):
+
+    inner_cv = GroupKFold(
+        n_splits=N_INTERNAL_FOLDS
+    )
+
+
+    oof_prediction = np.full(
+        len(X_train),
+        np.nan,
+        dtype=float
+    )
+
+
+    for inner_fold, (
+        inner_train_idx,
+        inner_valid_idx
+    ) in enumerate(
+
+        inner_cv.split(
+            X_train,
+            y_train,
+            groups=groups_train
+        ),
+
+        start=1
+
+    ):
+
+        model = make_model(
+            seed=RANDOM_STATE + inner_fold
+        )
+
+
+        X_inner_train = (
+            X_train.iloc[
+                inner_train_idx
+            ]
+        )
+
+        y_inner_train = (
+            y_train.iloc[
+                inner_train_idx
+            ]
+        )
+
+        X_inner_valid = (
+            X_train.iloc[
+                inner_valid_idx
+            ]
+        )
+
+
+        model.fit(
+            X_inner_train,
+            y_inner_train
+        )
+
+
+        oof_prediction[
+            inner_valid_idx
+        ] = model.predict(
+            X_inner_valid
+        )
+
+
+    valid_mask = np.isfinite(
+        oof_prediction
+    )
+
+
+    if not valid_mask.all():
+
+        raise RuntimeError(
+            "OOF residual generation failed."
+        )
+
+
+    residual = (
+        y_train.to_numpy()
+        -
+        oof_prediction
+    )
+
+
+    squared_residual = (
+        residual ** 2
+    )
+
+
+    return (
+        oof_prediction,
+        residual,
+        squared_residual
+    )
+
+
+# ============================================================
+# FIT FINAL MEAN + UNCERTAINTY MODELS
+# ============================================================
+
+def fit_uncertainty_models(
+    X_train,
+    y_train,
+    groups_train
+):
+
+    # --------------------------------------------------------
+    # OOF residual target
+    # --------------------------------------------------------
+
+    (
+        oof_prediction,
+        oof_residual,
+        squared_residual
+    ) = build_oof_residual_targets(
+        X_train,
+        y_train,
+        groups_train
+    )
+
+
+    # --------------------------------------------------------
+    # Mean model on ALL outer-training observations
+    # --------------------------------------------------------
+
+    mean_model = make_model(
+        seed=RANDOM_STATE
+    )
+
+    mean_model.fit(
+        X_train,
+        y_train
+    )
+
+
+    # --------------------------------------------------------
+    # Clip squared residuals to prevent a few massive errors
+    # from completely dominating variance fitting.
+    #
+    # This clipping threshold is calculated using training data
+    # only.
+    # --------------------------------------------------------
+
+    upper = np.quantile(
+        squared_residual,
+        0.99
+    )
+
+
+    variance_target = np.minimum(
+        squared_residual,
+        upper
+    )
+
+
+    # Log variance target improves numerical stability.
+    log_variance_target = np.log1p(
+        variance_target
+    )
+
+
+    # --------------------------------------------------------
+    # Variance model
+    # --------------------------------------------------------
+
+    variance_model = make_model(
+        seed=RANDOM_STATE + 100
+    )
+
+    variance_model.fit(
+        X_train,
+        log_variance_target
+    )
+
+
+    return (
+        mean_model,
+        variance_model,
+        upper
+    )
+
+
+# ============================================================
+# OUTER SPATIAL CV
+# ============================================================
+
+outer_cv = GroupKFold(
+    n_splits=N_OUTER_FOLDS
+)
+
+
+fold_results = []
+
+observation_results = []
+
+
+for fold, (
+    train_idx,
+    test_idx
+) in enumerate(
+
+    outer_cv.split(
+        X,
+        y,
+        groups=groups
+    ),
+
+    start=1
+):
+
+    print()
+    print("============================================================")
+    print(
+        "OUTER SPATIAL FOLD",
+        fold
+    )
+    print("============================================================")
+
+
+    X_train = X.iloc[
+        train_idx
+    ].copy()
+
+    y_train = y.iloc[
+        train_idx
+    ].copy()
+
+    groups_train = groups.iloc[
+        train_idx
+    ].copy()
+
+
+    X_test = X.iloc[
+        test_idx
+    ].copy()
+
+    y_test = y.iloc[
+        test_idx
+    ].copy()
+
+
+    # ========================================================
+    # FIT MEAN + VARIANCE MODELS
+    # ========================================================
+
+    (
+        mean_model,
+        variance_model,
+        variance_clip
+    ) = fit_uncertainty_models(
+
+        X_train,
+        y_train,
+        groups_train
+    )
+
+
+    # ========================================================
+    # TEST PREDICTIONS
+    # ========================================================
+
+    mean_prediction = mean_model.predict(
+        X_test
+    )
+
+
+    predicted_log_variance = (
+        variance_model.predict(
+            X_test
+        )
+    )
+
+
+    predicted_variance = (
+        np.expm1(
+            predicted_log_variance
+        )
+    )
+
+
+    predicted_variance = np.maximum(
+        predicted_variance,
+        1e-8
+    )
+
+
+    predicted_sigma = np.sqrt(
+        predicted_variance
+    )
+
+
+    # ========================================================
+    # CLIP EXTREME UNCERTAINTY FOR STABILITY
+    # ========================================================
+
+    max_sigma = np.sqrt(
+        max(
+            variance_clip,
+            1e-8
+        )
+    )
+
+
+    predicted_sigma = np.minimum(
+        predicted_sigma,
+        5.0 * max_sigma
+    )
+
+
+    # ========================================================
+    # METRICS
+    # ========================================================
+
+    prediction_error = (
+        y_test.to_numpy()
+        -
+        mean_prediction
+    )
+
+
+    absolute_error = np.abs(
+        prediction_error
+    )
+
+
+    squared_error = (
+        prediction_error ** 2
+    )
+
+
+    r2 = r2_score(
+        y_test,
+        mean_prediction
+    )
+
+
+    rmse = np.sqrt(
+        mean_squared_error(
+            y_test,
+            mean_prediction
+        )
+    )
+
+
+    mae = mean_absolute_error(
+        y_test,
+        mean_prediction
+    )
+
+
+    # ========================================================
+    # COVERAGE
+    # ========================================================
+    #
+    # Approximate 95% prediction interval:
+    #
+    #   prediction ± 1.96 sigma
+    #
+    # This is a diagnostic, not a claim of calibrated Gaussian
+    # uncertainty.
+    # ========================================================
+
+    lower_95 = (
+        mean_prediction
+        -
+        1.96 * predicted_sigma
+    )
+
+
+    upper_95 = (
+        mean_prediction
+        +
+        1.96 * predicted_sigma
+    )
+
+
+    coverage_95 = np.mean(
+        (
+            y_test.to_numpy()
+            >= lower_95
+        )
+        &
+        (
+            y_test.to_numpy()
+            <= upper_95
+        )
+    )
+
+
+    interval_width = np.mean(
+        upper_95
+        -
+        lower_95
+    )
+
+
+    # ========================================================
+    # PRINT PREDICTION RESULTS
+    # ========================================================
+
+    print()
+    print("PREDICTION PERFORMANCE")
+
+    print(
+        "R²   =",
+        round(
+            r2,
+            6
+        )
+    )
+
+    print(
+        "RMSE =",
+        round(
+            rmse,
+            6
+        )
+    )
+
+    print(
+        "MAE  =",
+        round(
+            mae,
+            6
+        )
+    )
+
+
+    print()
+    print("UNCERTAINTY")
+
+    print(
+        "95% coverage =",
+        round(
+            coverage_95 * 100,
+            3
+        ),
+        "%"
+    )
+
+    print(
+        "Mean interval width =",
+        round(
+            interval_width,
+            6
+        )
+    )
+
+
+    # ========================================================
+    # STORE FOLD
+    # ========================================================
+
+    fold_results.append({
+
+        "Fold":
+            fold,
+
+        "R2":
+            r2,
+
+        "RMSE":
+            rmse,
+
+        "MAE":
+            mae,
+
+        "Coverage_95":
+            coverage_95,
+
+        "Mean_Interval_Width":
+            interval_width,
+
+        "Mean_Predicted_Sigma":
+            predicted_sigma.mean()
+    })
+
+
+    # ========================================================
+    # STORE OBSERVATIONS
+    # ========================================================
+
+    meta = df.iloc[
+        test_idx
+    ][
+        [
+            "Code",
+            "Lat",
+            "Lon",
+            "spatial_block"
+        ]
+    ].copy()
+
+
+    meta["Fold"] = fold
+
+    meta["Observed"] = (
+        y_test.to_numpy()
+    )
+
+
+    meta["Predicted"] = (
+        mean_prediction
+    )
+
+
+    meta["Absolute_Error"] = (
+        absolute_error
+    )
+
+
+    meta["Squared_Error"] = (
+        squared_error
+    )
+
+
+    meta["Predicted_Sigma"] = (
+        predicted_sigma
+    )
+
+
+    meta["Predicted_Variance"] = (
+        predicted_variance
+    )
+
+
+    meta["Lower_95"] = (
+        lower_95
+    )
+
+
+    meta["Upper_95"] = (
+        upper_95
+    )
+
+
+    meta["Covered_95"] = (
+        (
+            y_test.to_numpy()
+            >= lower_95
+        )
+        &
+        (
+            y_test.to_numpy()
+            <= upper_95
+        )
+    )
+
+
+    observation_results.append(
+        meta
+    )
+
+
+# ============================================================
+# COMBINE
+# ============================================================
+
+fold_df = pd.DataFrame(
+    fold_results
+)
+
+obs_df = pd.concat(
+    observation_results,
+    ignore_index=True
+)
+
+
+# ============================================================
+# UNCERTAINTY / ERROR ASSOCIATION
+# ============================================================
+
+pearson_r = np.corrcoef(
+    obs_df["Predicted_Sigma"],
+    obs_df["Absolute_Error"]
+)[0, 1]
+
+
+spearman_r = (
+    obs_df[
+        [
+            "Predicted_Sigma",
+            "Absolute_Error"
+        ]
+    ]
+    .rank()
+    .corr()
+    .iloc[0, 1]
+)
+
+
+print()
+print("============================================================")
+print("UNCERTAINTY / ERROR ASSOCIATION")
+print("============================================================")
+
+print(
+    "Pearson r :",
+    round(
+        pearson_r,
+        6
+    )
+)
+
+print(
+    "Spearman r:",
+    round(
+        spearman_r,
+        6
+    )
+)
+
+
+# ============================================================
+# UNCERTAINTY QUARTILES
+# ============================================================
+
+obs_df["Uncertainty_Quartile"] = pd.qcut(
+
+    obs_df["Predicted_Sigma"],
+
+    q=4,
+
+    labels=[
+        "Q1 - lowest uncertainty",
+        "Q2",
+        "Q3",
+        "Q4 - highest uncertainty"
+    ],
+
+    duplicates="drop"
+)
+
+
+uncertainty_summary = (
+    obs_df
+    .groupby(
+        "Uncertainty_Quartile",
+        observed=True
+    )
+    .agg(
+
+        Observations=(
+            "Code",
+            "count"
+        ),
+
+        Mean_Predicted_Sigma=(
+            "Predicted_Sigma",
+            "mean"
+        ),
+
+        Mean_Absolute_Error=(
+            "Absolute_Error",
+            "mean"
+        ),
+
+        RMSE=(
+            "Squared_Error",
+            lambda x:
+            np.sqrt(
+                np.mean(x)
+            )
+        ),
+
+        Coverage_95=(
+            "Covered_95",
+            "mean"
+        )
+    )
+    .reset_index()
+)
+
+
+print()
+print("============================================================")
+print("ERROR BY PREDICTED UNCERTAINTY QUARTILE")
+print("============================================================")
+
+print(
+    uncertainty_summary.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# Q4 VS Q1 ERROR DEGRADATION
+# ============================================================
+
+q1 = uncertainty_summary.iloc[0]
+
+q4 = uncertainty_summary.iloc[-1]
+
+
+q4_q1_degradation = (
+
+    (
+        q4["Mean_Absolute_Error"]
+        -
+        q1["Mean_Absolute_Error"]
+    )
+    /
+    q1["Mean_Absolute_Error"]
+    *
+    100
+)
+
+
+print()
+print("============================================================")
+print("Q4 VS Q1 UNCERTAINTY DEGRADATION")
+print("============================================================")
+
+print(
+    "MAE degradation:",
+    round(
+        q4_q1_degradation,
+        4
+    ),
+    "%"
+)
+
+
+# ============================================================
+# RISK-COVERAGE ANALYSIS
+# ============================================================
+#
+# Sort observations from LOW to HIGH predicted uncertainty.
+#
+# At each retained fraction, calculate the average actual error.
+#
+# If uncertainty is useful, removing the highest-uncertainty
+# observations should preferentially remove high-error cases.
+# ============================================================
+
+sorted_obs = obs_df.sort_values(
+    "Predicted_Sigma"
+).reset_index(
+    drop=True
+)
+
+
+coverage_levels = [
+    1.00,
+    0.90,
+    0.80,
+    0.70,
+    0.60,
+    0.50
+]
+
+
+risk_rows = []
+
+
+for coverage_level in coverage_levels:
+
+    n_keep = int(
+        len(sorted_obs)
+        * coverage_level
+    )
+
+
+    retained = sorted_obs.iloc[
+        :n_keep
+    ]
+
+
+    risk_rows.append({
+
+        "Coverage":
+            coverage_level,
+
+        "Observations_Retained":
+            len(retained),
+
+        "Mean_Predicted_Sigma":
+            retained["Predicted_Sigma"].mean(),
+
+        "Mean_Absolute_Error":
+            retained["Absolute_Error"].mean(),
+
+        "RMSE":
+            np.sqrt(
+                retained["Squared_Error"].mean()
+            )
+    })
+
+
+risk_df = pd.DataFrame(
+    risk_rows
+)
+
+
+print()
+print("============================================================")
+print("RISK-COVERAGE")
+print("============================================================")
+
+print(
+    risk_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# HIGH-RISK CONCENTRATION
+# ============================================================
+#
+# What fraction of all absolute error lies in the highest 20%
+# uncertainty observations?
+# ============================================================
+
+n_high = int(
+    len(sorted_obs)
+    * 0.20
+)
+
+
+high_uncertainty = sorted_obs.iloc[
+    -n_high:
+]
+
+
+total_error = (
+    obs_df["Absolute_Error"].sum()
+)
+
+
+high_error = (
+    high_uncertainty[
+        "Absolute_Error"
+    ].sum()
+)
+
+
+high_error_share = (
+    high_error
+    /
+    total_error
+)
+
+
+print()
+print("============================================================")
+print("HIGH-UNCERTAINTY ERROR CONCENTRATION")
+print("============================================================")
+
+print(
+    "Highest 20% uncertainty observations:",
+    len(high_uncertainty)
+)
+
+print(
+    "Share of total absolute error:",
+    round(
+        high_error_share * 100,
+        3
+    ),
+    "%"
+)
+
+
+# ============================================================
+# FOLD SUMMARY
+# ============================================================
+
+cv_summary = pd.DataFrame({
+
+    "Metric": [
+        "R2",
+        "RMSE",
+        "MAE",
+        "Coverage_95"
+    ],
+
+    "Mean": [
+
+        fold_df["R2"].mean(),
+
+        fold_df["RMSE"].mean(),
+
+        fold_df["MAE"].mean(),
+
+        fold_df["Coverage_95"].mean()
+    ],
+
+    "SD": [
+
+        fold_df["R2"].std(
+            ddof=1
+        ),
+
+        fold_df["RMSE"].std(
+            ddof=1
+        ),
+
+        fold_df["MAE"].std(
+            ddof=1
+        ),
+
+        fold_df["Coverage_95"].std(
+            ddof=1
+        )
+    ]
+})
+
+
+print()
+print("============================================================")
+print("FIVE-FOLD SUMMARY")
+print("============================================================")
+
+print(
+    cv_summary.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+fold_df.to_csv(
+    "YCEO_Uncertainty_FoldResults.csv",
+    index=False
+)
+
+obs_df.to_csv(
+    "YCEO_Uncertainty_ObservationResults.csv",
+    index=False
+)
+
+uncertainty_summary.to_csv(
+    "YCEO_Uncertainty_ErrorByQuartile.csv",
+    index=False
+)
+
+risk_df.to_csv(
+    "YCEO_Uncertainty_RiskCoverage.csv",
+    index=False
+)
+
+cv_summary.to_csv(
+    "YCEO_Uncertainty_Summary.csv",
+    index=False
+)
+
+
+# ============================================================
+# TEXT SUMMARY
+# ============================================================
+
+summary_text = f"""
+UNCERTAINTY-AWARE XGBOOST SUMMARY
+
+Five-fold spatial CV:
+R2   = {fold_df["R2"].mean():.6f} ± {fold_df["R2"].std(ddof=1):.6f}
+RMSE = {fold_df["RMSE"].mean():.6f} ± {fold_df["RMSE"].std(ddof=1):.6f}
+MAE  = {fold_df["MAE"].mean():.6f} ± {fold_df["MAE"].std(ddof=1):.6f}
+
+95% interval coverage:
+{fold_df["Coverage_95"].mean() * 100:.3f}%
+
+Uncertainty-error Pearson correlation:
+{pearson_r:.6f}
+
+Uncertainty-error Spearman correlation:
+{spearman_r:.6f}
+
+Q4/Q1 uncertainty-based MAE degradation:
+{q4_q1_degradation:.4f}%
+
+Highest-uncertainty 20% share of total absolute error:
+{high_error_share * 100:.3f}%
+"""
+
+
+with open(
+    "YCEO_Uncertainty_Report.txt",
+    "w"
+) as f:
+
+    f.write(
+        summary_text
+    )
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print()
+print("============================================================")
+print("FILES CREATED")
+print("============================================================")
+
+print(
+    "YCEO_Uncertainty_FoldResults.csv"
+)
+
+print(
+    "YCEO_Uncertainty_ObservationResults.csv"
+)
+
+print(
+    "YCEO_Uncertainty_ErrorByQuartile.csv"
+)
+
+print(
+    "YCEO_Uncertainty_RiskCoverage.csv"
+)
+
+print(
+    "YCEO_Uncertainty_Summary.csv"
+)
+
+print(
+    "YCEO_Uncertainty_Report.txt"
+)
+
+print()
+print(
+    "Uncertainty-aware XGBoost experiment complete."
+)
+============================================================
+FILE: .\code\uncertainty\nested_uncertainty_calibration.py
+============================================================
+import os
+import random
+
+import numpy as np
+import pandas as pd
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = (
+    Path(__file__).resolve().parents[2]
+)
+
+sys.path.insert(
+    0,
+    str(PROJECT_ROOT / "code")
+)
+
+from utils.paths import (
+    UNCERTAINTY_RESULTS_DIR
+)
+
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import (
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error
+)
+
+from scipy.stats import spearmanr
+
+from xgboost import XGBRegressor
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+INPUT_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_Uncertainty_ObservationResults.csv"
+)
+
+RANDOM_STATE = 42
+
+N_OUTER_FOLDS = 5
+
+N_CALIBRATION_FOLDS = 4
+
+FEATURES = [
+    "NDVI",
+    "Elevation",
+    "Builtup",
+    "Population",
+    "Mean_Temp_C",
+    "Mean_Monthly_Precip_mm",
+    "Urban_LC_Fraction",
+    "Water_LC_Fraction",
+    "Vegetation_LC_Fraction"
+]
+
+TARGET = "Annual_day"
+
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+os.environ["PYTHONHASHSEED"] = str(RANDOM_STATE)
+
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+df = pd.read_csv(
+    DATA_FILE
+)
+
+df = df.dropna(
+    subset=FEATURES + [
+        TARGET,
+        "Lat",
+        "Lon"
+    ]
+).copy()
+
+df = df[
+    df["Population"] >= 0
+].copy()
+
+df = df[
+    (df["NDVI"] >= -1)
+    &
+    (df["NDVI"] <= 1)
+].copy()
+
+
+# ============================================================
+# SPATIAL BLOCKS
+# ============================================================
+
+df["lat_block"] = np.floor(
+    df["Lat"] / 10
+).astype(int)
+
+df["lon_block"] = np.floor(
+    df["Lon"] / 10
+).astype(int)
+
+df["spatial_block"] = (
+    df["lat_block"].astype(str)
+    + "_"
+    + df["lon_block"].astype(str)
+)
+
+
+X = df[FEATURES].copy()
+
+y = df[TARGET].copy()
+
+groups = df["spatial_block"].copy()
+
+
+print()
+print("============================================================")
+print("STRICT NESTED UNCERTAINTY CALIBRATION")
+print("============================================================")
+
+print(
+    "Dataset:",
+    df.shape
+)
+
+print(
+    "Features:",
+    len(FEATURES)
+)
+
+print(
+    "Spatial blocks:",
+    groups.nunique()
+)
+
+print(
+    "Outer folds:",
+    N_OUTER_FOLDS
+)
+
+print(
+    "Internal calibration folds:",
+    N_CALIBRATION_FOLDS
+)
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+def make_model(
+    seed=RANDOM_STATE
+):
+
+    return XGBRegressor(
+
+        n_estimators=500,
+
+        learning_rate=0.03,
+
+        max_depth=6,
+
+        min_child_weight=5,
+
+        subsample=0.8,
+
+        colsample_bytree=0.9,
+
+        reg_lambda=1.0,
+
+        objective="reg:squarederror",
+
+        eval_metric="rmse",
+
+        random_state=seed,
+
+        n_jobs=-1,
+
+        tree_method="hist"
+    )
+
+
+# ============================================================
+# BUILD OUT-OF-FOLD RESIDUALS INSIDE OUTER TRAINING SET
+# ============================================================
+#
+# This generates residual targets for uncertainty calibration.
+#
+# Every residual is produced by a model that did NOT train on
+# the corresponding observation.
+#
+# The inner folds are spatial GroupKFold folds.
+# ============================================================
+
+def generate_internal_oof_residuals(
+    X_outer_train,
+    y_outer_train,
+    groups_outer_train
+):
+
+    inner_cv = GroupKFold(
+        n_splits=N_CALIBRATION_FOLDS
+    )
+
+    oof_prediction = np.full(
+        len(X_outer_train),
+        np.nan,
+        dtype=float
+    )
+
+
+    for inner_fold, (
+        inner_train_idx,
+        inner_valid_idx
+    ) in enumerate(
+
+        inner_cv.split(
+            X_outer_train,
+            y_outer_train,
+            groups=groups_outer_train
+        ),
+
+        start=1
+    ):
+
+        model = make_model(
+            seed=RANDOM_STATE + inner_fold
+        )
+
+
+        model.fit(
+            X_outer_train.iloc[
+                inner_train_idx
+            ],
+
+            y_outer_train.iloc[
+                inner_train_idx
+            ]
+        )
+
+
+        oof_prediction[
+            inner_valid_idx
+        ] = model.predict(
+
+            X_outer_train.iloc[
+                inner_valid_idx
+            ]
+        )
+
+
+    if not np.isfinite(
+        oof_prediction
+    ).all():
+
+        raise RuntimeError(
+            "Internal OOF predictions contain invalid values."
+        )
+
+
+    residual = (
+        y_outer_train.to_numpy()
+        -
+        oof_prediction
+    )
+
+
+    squared_residual = (
+        residual ** 2
+    )
+
+
+    absolute_residual = np.abs(
+        residual
+    )
+
+
+    return (
+        oof_prediction,
+        residual,
+        squared_residual,
+        absolute_residual
+    )
+
+
+# ============================================================
+# FIT FINAL MEAN MODEL
+# ============================================================
+
+def fit_mean_model(
+    X_train,
+    y_train
+):
+
+    model = make_model(
+        seed=RANDOM_STATE
+    )
+
+    model.fit(
+        X_train,
+        y_train
+    )
+
+    return model
+
+
+# ============================================================
+# FIT UNCERTAINTY MODEL
+# ============================================================
+#
+# The uncertainty target comes from INTERNAL OOF residuals.
+#
+# Therefore the uncertainty model is not trained on in-sample
+# residuals.
+# ============================================================
+
+def fit_uncertainty_model(
+    X_outer_train,
+    y_outer_train,
+    groups_outer_train
+):
+
+    (
+        oof_prediction,
+        residual,
+        squared_residual,
+        absolute_residual
+    ) = generate_internal_oof_residuals(
+
+        X_outer_train,
+        y_outer_train,
+        groups_outer_train
+    )
+
+
+    # --------------------------------------------------------
+    # Clip only extreme residual targets.
+    # Threshold is calculated inside outer training only.
+    # --------------------------------------------------------
+
+    clip_value = np.quantile(
+        squared_residual,
+        0.99
+    )
+
+
+    variance_target = np.minimum(
+        squared_residual,
+        clip_value
+    )
+
+
+    # Log transform.
+    log_variance_target = np.log1p(
+        variance_target
+    )
+
+
+    variance_model = make_model(
+        seed=RANDOM_STATE + 1000
+    )
+
+
+    variance_model.fit(
+        X_outer_train,
+        log_variance_target
+    )
+
+
+    return (
+        variance_model,
+        clip_value
+    )
+
+
+# ============================================================
+# CALIBRATE SIGMA USING INNER OOF DATA
+# ============================================================
+#
+# We want a calibration map from raw predicted sigma to
+# empirical absolute error.
+#
+# The calibrator is fitted only on OOF predictions/residuals
+# generated from the outer training set.
+#
+# We use quantile binning rather than an external library so
+# the procedure is completely transparent.
+# ============================================================
+
+def fit_sigma_calibrator(
+    X_outer_train,
+    y_outer_train,
+    groups_outer_train,
+    variance_model
+):
+
+    (
+        oof_prediction,
+        residual,
+        squared_residual,
+        absolute_residual
+    ) = generate_internal_oof_residuals(
+
+        X_outer_train,
+        y_outer_train,
+        groups_outer_train
+    )
+
+
+    raw_log_variance = (
+        variance_model.predict(
+            X_outer_train
+        )
+    )
+
+
+    raw_variance = np.expm1(
+        raw_log_variance
+    )
+
+
+    raw_variance = np.maximum(
+        raw_variance,
+        1e-8
+    )
+
+
+    raw_sigma = np.sqrt(
+        raw_variance
+    )
+
+
+    calibration_frame = pd.DataFrame({
+
+        "Raw_Sigma":
+            raw_sigma,
+
+        "Absolute_Error":
+            absolute_residual
+
+    })
+
+
+    calibration_frame[
+        "Sigma_Bin"
+    ] = pd.qcut(
+
+        calibration_frame[
+            "Raw_Sigma"
+        ],
+
+        q=20,
+
+        labels=False,
+
+        duplicates="drop"
+    )
+
+
+    bin_table = (
+
+        calibration_frame
+
+        .groupby(
+            "Sigma_Bin",
+            observed=True
+        )
+
+        .agg(
+
+            Mean_Raw_Sigma=(
+                "Raw_Sigma",
+                "mean"
+            ),
+
+            Mean_Absolute_Error=(
+                "Absolute_Error",
+                "mean"
+            ),
+
+            Observations=(
+                "Raw_Sigma",
+                "count"
+            )
+        )
+
+        .reset_index()
+    )
+
+
+    # Ensure monotonic calibration mapping.
+    #
+    # Isotonic regression is preferable here because we do not
+    # assume a particular parametric relationship.
+
+    from sklearn.isotonic import IsotonicRegression
+
+
+    isotonic = IsotonicRegression(
+        increasing=True,
+        out_of_bounds="clip"
+    )
+
+
+    isotonic.fit(
+
+        bin_table[
+            "Mean_Raw_Sigma"
+        ],
+
+        bin_table[
+            "Mean_Absolute_Error"
+        ],
+
+        sample_weight=bin_table[
+            "Observations"
+        ]
+    )
+
+
+    return (
+        isotonic,
+        bin_table
+    )
+
+
+# ============================================================
+# CREATE CALIBRATED TEST SIGMA
+# ============================================================
+
+def calibrated_test_sigma(
+    X_test,
+    variance_model,
+    isotonic
+):
+
+    raw_log_variance = (
+        variance_model.predict(
+            X_test
+        )
+    )
+
+
+    raw_variance = np.expm1(
+        raw_log_variance
+    )
+
+
+    raw_variance = np.maximum(
+        raw_variance,
+        1e-8
+    )
+
+
+    raw_sigma = np.sqrt(
+        raw_variance
+    )
+
+
+    calibrated_abs_error = (
+        isotonic.predict(
+            raw_sigma
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Convert expected absolute error into Gaussian-like sigma:
+    #
+    # E|e| ≈ sigma * sqrt(2/pi)
+    #
+    # This is a scale conversion only.
+    # --------------------------------------------------------
+
+    calibrated_sigma = (
+        calibrated_abs_error
+        /
+        np.sqrt(
+            2.0 / np.pi
+        )
+    )
+
+
+    calibrated_sigma = np.maximum(
+        calibrated_sigma,
+        1e-6
+    )
+
+
+    return (
+        raw_sigma,
+        calibrated_sigma
+    )
+
+
+# ============================================================
+# INTERVAL METRICS
+# ============================================================
+
+def interval_metrics(
+    observed,
+    prediction,
+    sigma,
+    z
+):
+
+    lower = (
+        prediction
+        -
+        z * sigma
+    )
+
+    upper = (
+        prediction
+        +
+        z * sigma
+    )
+
+
+    covered = (
+        (observed >= lower)
+        &
+        (observed <= upper)
+    )
+
+
+    coverage = covered.mean()
+
+    width = np.mean(
+        upper - lower
+    )
+
+
+    return (
+        coverage,
+        width
+    )
+
+
+# ============================================================
+# OUTER CV
+# ============================================================
+
+outer_cv = GroupKFold(
+    n_splits=N_OUTER_FOLDS
+)
+
+
+fold_results = []
+
+all_observations = []
+
+all_calibration_bins = []
+
+
+for fold, (
+    outer_train_idx,
+    outer_test_idx
+) in enumerate(
+
+    outer_cv.split(
+        X,
+        y,
+        groups=groups
+    ),
+
+    start=1
+):
+
+    print()
+    print("============================================================")
+    print(
+        "OUTER SPATIAL FOLD",
+        fold
+    )
+    print("============================================================")
+
+
+    X_outer_train = X.iloc[
+        outer_train_idx
+    ].copy()
+
+    y_outer_train = y.iloc[
+        outer_train_idx
+    ].copy()
+
+    groups_outer_train = groups.iloc[
+        outer_train_idx
+    ].copy()
+
+
+    X_test = X.iloc[
+        outer_test_idx
+    ].copy()
+
+    y_test = y.iloc[
+        outer_test_idx
+    ].copy()
+
+
+    # ========================================================
+    # MEAN MODEL
+    # ========================================================
+
+    mean_model = fit_mean_model(
+        X_outer_train,
+        y_outer_train
+    )
+
+
+    test_prediction = mean_model.predict(
+        X_test
+    )
+
+
+    # ========================================================
+    # UNCERTAINTY MODEL
+    # ========================================================
+
+    (
+        variance_model,
+        variance_clip
+    ) = fit_uncertainty_model(
+
+        X_outer_train,
+        y_outer_train,
+        groups_outer_train
+    )
+
+
+    # ========================================================
+    # CALIBRATOR
+    # ========================================================
+
+    (
+        isotonic,
+        calibration_bins
+    ) = fit_sigma_calibrator(
+
+        X_outer_train,
+        y_outer_train,
+        groups_outer_train,
+        variance_model
+    )
+
+
+    calibration_bins[
+        "OuterFold"
+    ] = fold
+
+
+    all_calibration_bins.append(
+        calibration_bins
+    )
+
+
+    # ========================================================
+    # TEST UNCERTAINTY
+    # ========================================================
+
+    (
+        raw_sigma,
+        calibrated_sigma
+    ) = calibrated_test_sigma(
+
+        X_test,
+        variance_model,
+        isotonic
+    )
+
+
+    observed = y_test.to_numpy()
+
+
+    absolute_error = np.abs(
+        observed
+        -
+        test_prediction
+    )
+
+
+    squared_error = (
+        observed
+        -
+        test_prediction
+    ) ** 2
+
+
+    # ========================================================
+    # POINT PREDICTION
+    # ========================================================
+
+    r2 = r2_score(
+        y_test,
+        test_prediction
+    )
+
+    rmse = np.sqrt(
+        mean_squared_error(
+            y_test,
+            test_prediction
+        )
+    )
+
+    mae = mean_absolute_error(
+        y_test,
+        test_prediction
+    )
+
+
+    # ========================================================
+    # COVERAGE
+    # ========================================================
+
+    coverage_80, width_80 = interval_metrics(
+        observed,
+        test_prediction,
+        calibrated_sigma,
+        1.281551565545
+    )
+
+
+    coverage_90, width_90 = interval_metrics(
+        observed,
+        test_prediction,
+        calibrated_sigma,
+        1.644853626951
+    )
+
+
+    coverage_95, width_95 = interval_metrics(
+        observed,
+        test_prediction,
+        calibrated_sigma,
+        1.959963984540
+    )
+
+
+    print()
+    print("POINT PREDICTION")
+
+    print(
+        "R²   =",
+        round(
+            r2,
+            6
+        )
+    )
+
+    print(
+        "RMSE =",
+        round(
+            rmse,
+            6
+        )
+    )
+
+    print(
+        "MAE  =",
+        round(
+            mae,
+            6
+        )
+    )
+
+
+    print()
+    print("CALIBRATED INTERVAL COVERAGE")
+
+    print(
+        "80% =",
+        round(
+            coverage_80 * 100,
+            3
+        ),
+        "%",
+        "width =",
+        round(
+            width_80,
+            6
+        )
+    )
+
+    print(
+        "90% =",
+        round(
+            coverage_90 * 100,
+            3
+        ),
+        "%",
+        "width =",
+        round(
+            width_90,
+            6
+        )
+    )
+
+    print(
+        "95% =",
+        round(
+            coverage_95 * 100,
+            3
+        ),
+        "%",
+        "width =",
+        round(
+            width_95,
+            6
+        )
+    )
+
+
+    # ========================================================
+    # STORE FOLD
+    # ========================================================
+
+    fold_results.append({
+
+        "Fold":
+            fold,
+
+        "R2":
+            r2,
+
+        "RMSE":
+            rmse,
+
+        "MAE":
+            mae,
+
+        "Coverage_80":
+            coverage_80,
+
+        "Coverage_90":
+            coverage_90,
+
+        "Coverage_95":
+            coverage_95,
+
+        "Width_80":
+            width_80,
+
+        "Width_90":
+            width_90,
+
+        "Width_95":
+            width_95,
+
+        "Mean_Raw_Sigma":
+            raw_sigma.mean(),
+
+        "Mean_Calibrated_Sigma":
+            calibrated_sigma.mean()
+    })
+
+
+    # ========================================================
+    # OBSERVATIONS
+    # ========================================================
+
+    meta = df.iloc[
+        outer_test_idx
+    ][
+        [
+            "Code",
+            "Lat",
+            "Lon",
+            "spatial_block"
+        ]
+    ].copy()
+
+
+    meta["Fold"] = fold
+
+    meta["Observed"] = observed
+
+    meta["Predicted"] = (
+        test_prediction
+    )
+
+    meta["Absolute_Error"] = (
+        absolute_error
+    )
+
+    meta["Squared_Error"] = (
+        squared_error
+    )
+
+    meta["Raw_Sigma"] = (
+        raw_sigma
+    )
+
+    meta["Calibrated_Sigma"] = (
+        calibrated_sigma
+    )
+
+
+    for level, z in [
+        ("80", 1.281551565545),
+        ("90", 1.644853626951),
+        ("95", 1.959963984540)
+    ]:
+
+        lower = (
+            test_prediction
+            - z * calibrated_sigma
+        )
+
+        upper = (
+            test_prediction
+            + z * calibrated_sigma
+        )
+
+
+        meta[
+            f"Lower_{level}"
+        ] = lower
+
+        meta[
+            f"Upper_{level}"
+        ] = upper
+
+        meta[
+            f"Covered_{level}"
+        ] = (
+            (observed >= lower)
+            &
+            (observed <= upper)
+        )
+
+
+    all_observations.append(
+        meta
+    )
+
+
+# ============================================================
+# FINAL DATAFRAMES
+# ============================================================
+
+fold_df = pd.DataFrame(
+    fold_results
+)
+
+obs_df = pd.concat(
+    all_observations,
+    ignore_index=True
+)
+
+calibration_bins_df = pd.concat(
+    all_calibration_bins,
+    ignore_index=True
+)
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+summary = pd.DataFrame({
+
+    "Metric": [
+        "R2",
+        "RMSE",
+        "MAE",
+        "Coverage_80",
+        "Coverage_90",
+        "Coverage_95"
+    ],
+
+    "Mean": [
+
+        fold_df["R2"].mean(),
+
+        fold_df["RMSE"].mean(),
+
+        fold_df["MAE"].mean(),
+
+        fold_df["Coverage_80"].mean(),
+
+        fold_df["Coverage_90"].mean(),
+
+        fold_df["Coverage_95"].mean()
+    ],
+
+    "SD": [
+
+        fold_df["R2"].std(
+            ddof=1
+        ),
+
+        fold_df["RMSE"].std(
+            ddof=1
+        ),
+
+        fold_df["MAE"].std(
+            ddof=1
+        ),
+
+        fold_df["Coverage_80"].std(
+            ddof=1
+        ),
+
+        fold_df["Coverage_90"].std(
+            ddof=1
+        ),
+
+        fold_df["Coverage_95"].std(
+            ddof=1
+        )
+    ]
+})
+
+
+# ============================================================
+# UNCERTAINTY / ERROR ASSOCIATION
+# ============================================================
+
+raw_pearson = np.corrcoef(
+    obs_df["Raw_Sigma"],
+    obs_df["Absolute_Error"]
+)[0, 1]
+
+
+cal_pearson = np.corrcoef(
+    obs_df["Calibrated_Sigma"],
+    obs_df["Absolute_Error"]
+)[0, 1]
+
+
+raw_spearman, raw_spearman_p = spearmanr(
+    obs_df["Raw_Sigma"],
+    obs_df["Absolute_Error"]
+)
+
+
+cal_spearman, cal_spearman_p = spearmanr(
+    obs_df["Calibrated_Sigma"],
+    obs_df["Absolute_Error"]
+)
+
+
+print()
+print("============================================================")
+print("UNCERTAINTY / ERROR ASSOCIATION")
+print("============================================================")
+
+print(
+    "Raw Pearson:",
+    round(
+        raw_pearson,
+        6
+    )
+)
+
+print(
+    "Calibrated Pearson:",
+    round(
+        cal_pearson,
+        6
+    )
+)
+
+print(
+    "Raw Spearman:",
+    round(
+        raw_spearman,
+        6
+    ),
+    "p =",
+    raw_spearman_p
+)
+
+print(
+    "Calibrated Spearman:",
+    round(
+        cal_spearman,
+        6
+    ),
+    "p =",
+    cal_spearman_p
+)
+
+
+# ============================================================
+# CALIBRATED UNCERTAINTY QUARTILES
+# ============================================================
+
+obs_df[
+    "Calibrated_Uncertainty_Quartile"
+] = pd.qcut(
+
+    obs_df[
+        "Calibrated_Sigma"
+    ],
+
+    q=4,
+
+    labels=[
+        "Q1 - lowest",
+        "Q2",
+        "Q3",
+        "Q4 - highest"
+    ],
+
+    duplicates="drop"
+)
+
+
+quartile_df = (
+
+    obs_df
+
+    .groupby(
+        "Calibrated_Uncertainty_Quartile",
+        observed=True
+    )
+
+    .agg(
+
+        Observations=(
+            "Code",
+            "count"
+        ),
+
+        Mean_Calibrated_Sigma=(
+            "Calibrated_Sigma",
+            "mean"
+        ),
+
+        Mean_Absolute_Error=(
+            "Absolute_Error",
+            "mean"
+        ),
+
+        RMSE=(
+            "Squared_Error",
+            lambda x:
+            np.sqrt(
+                np.mean(x)
+            )
+        )
+    )
+
+    .reset_index()
+)
+
+
+print()
+print("============================================================")
+print("ERROR BY CALIBRATED UNCERTAINTY QUARTILE")
+print("============================================================")
+
+print(
+    quartile_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# Q4/Q1 DEGRADATION
+# ============================================================
+
+q1 = quartile_df.iloc[0]
+
+q4 = quartile_df.iloc[-1]
+
+
+q4_q1_degradation = (
+
+    (
+        q4["Mean_Absolute_Error"]
+        -
+        q1["Mean_Absolute_Error"]
+    )
+    /
+    q1["Mean_Absolute_Error"]
+    *
+    100
+)
+
+
+print()
+print("============================================================")
+print("Q4 VS Q1 CALIBRATED RISK")
+print("============================================================")
+
+print(
+    "MAE degradation:",
+    round(
+        q4_q1_degradation,
+        4
+    ),
+    "%"
+)
+
+
+# ============================================================
+# RISK-COVERAGE
+# ============================================================
+
+sorted_df = obs_df.sort_values(
+    "Calibrated_Sigma"
+).reset_index(
+    drop=True
+)
+
+
+coverage_levels = [
+    1.00,
+    0.90,
+    0.80,
+    0.70,
+    0.60,
+    0.50
+]
+
+
+risk_rows = []
+
+
+for coverage_level in coverage_levels:
+
+    n_keep = int(
+        len(sorted_df)
+        * coverage_level
+    )
+
+
+    retained = sorted_df.iloc[
+        :n_keep
+    ]
+
+
+    risk_rows.append({
+
+        "Coverage":
+            coverage_level,
+
+        "Observations_Retained":
+            len(retained),
+
+        "Mean_Calibrated_Sigma":
+            retained[
+                "Calibrated_Sigma"
+            ].mean(),
+
+        "Mean_Absolute_Error":
+            retained[
+                "Absolute_Error"
+            ].mean(),
+
+        "RMSE":
+            np.sqrt(
+                retained[
+                    "Squared_Error"
+                ].mean()
+            )
+    })
+
+
+risk_df = pd.DataFrame(
+    risk_rows
+)
+
+
+print()
+print("============================================================")
+print("CALIBRATED RISK-COVERAGE")
+print("============================================================")
+
+print(
+    risk_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# TOP 20% ERROR CONCENTRATION
+# ============================================================
+
+n_high = int(
+    len(sorted_df) * 0.20
+)
+
+
+high_risk = sorted_df.iloc[
+    -n_high:
+]
+
+
+error_share = (
+    high_risk[
+        "Absolute_Error"
+    ].sum()
+    /
+    obs_df[
+        "Absolute_Error"
+    ].sum()
+)
+
+
+print()
+print("============================================================")
+print("HIGHEST-RISK ERROR CONCENTRATION")
+print("============================================================")
+
+print(
+    "Highest 20% risk observations:",
+    n_high
+)
+
+print(
+    "Share of total absolute error:",
+    round(
+        error_share * 100,
+        3
+    ),
+    "%"
+)
+
+
+# ============================================================
+# COVERAGE CALIBRATION ERROR
+# ============================================================
+
+nominal = np.array([
+    0.80,
+    0.90,
+    0.95
+])
+
+
+observed = np.array([
+    fold_df["Coverage_80"].mean(),
+    fold_df["Coverage_90"].mean(),
+    fold_df["Coverage_95"].mean()
+])
+
+
+coverage_mae = np.mean(
+    np.abs(
+        observed
+        -
+        nominal
+    )
+)
+
+
+coverage_max_error = np.max(
+    np.abs(
+        observed
+        -
+        nominal
+    )
+)
+
+
+print()
+print("============================================================")
+print("CALIBRATION ERROR")
+print("============================================================")
+
+print(
+    "Mean absolute coverage error:",
+    round(
+        coverage_mae,
+        6
+    )
+)
+
+print(
+    "Maximum coverage error:",
+    round(
+        coverage_max_error,
+        6
+    )
+)
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+fold_df.to_csv(
+    "YCEO_NestedUncertainty_FoldResults.csv",
+    index=False
+)
+
+obs_df.to_csv(
+    "YCEO_NestedUncertainty_ObservationResults.csv",
+    index=False
+)
+
+calibration_bins_df.to_csv(
+    "YCEO_NestedUncertainty_CalibrationBins.csv",
+    index=False
+)
+
+summary.to_csv(
+    "YCEO_NestedUncertainty_Summary.csv",
+    index=False
+)
+
+quartile_df.to_csv(
+    "YCEO_NestedUncertainty_Quartiles.csv",
+    index=False
+)
+
+risk_df.to_csv(
+    "YCEO_NestedUncertainty_RiskCoverage.csv",
+    index=False
+)
+
+
+calibration_metrics = pd.DataFrame([{
+
+    "Raw_Pearson":
+        raw_pearson,
+
+    "Calibrated_Pearson":
+        cal_pearson,
+
+    "Raw_Spearman":
+        raw_spearman,
+
+    "Raw_Spearman_p":
+        raw_spearman_p,
+
+    "Calibrated_Spearman":
+        cal_spearman,
+
+    "Calibrated_Spearman_p":
+        cal_spearman_p,
+
+    "Q4_Q1_MAE_Degradation":
+        q4_q1_degradation,
+
+    "High_Risk_20_Error_Share":
+        error_share,
+
+    "Mean_Coverage_Error":
+        coverage_mae,
+
+    "Maximum_Coverage_Error":
+        coverage_max_error
+}])
+
+
+calibration_metrics.to_csv(
+    "YCEO_NestedUncertainty_CalibrationMetrics.csv",
+    index=False
+)
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print()
+print("============================================================")
+print("FILES CREATED")
+print("============================================================")
+
+print(
+    "YCEO_NestedUncertainty_FoldResults.csv"
+)
+
+print(
+    "YCEO_NestedUncertainty_ObservationResults.csv"
+)
+
+print(
+    "YCEO_NestedUncertainty_CalibrationBins.csv"
+)
+
+print(
+    "YCEO_NestedUncertainty_Summary.csv"
+)
+
+print(
+    "YCEO_NestedUncertainty_Quartiles.csv"
+)
+
+print(
+    "YCEO_NestedUncertainty_RiskCoverage.csv"
+)
+
+print(
+    "YCEO_NestedUncertainty_CalibrationMetrics.csv"
+)
+
+print()
+print(
+    "Strict nested uncertainty calibration complete."
+)
+============================================================
+FILE: .\code\uncertainty\uncertainty_vs_ood_detection.py
+============================================================
+import numpy as np
+import pandas as pd
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = (
+    Path(__file__).resolve().parents[2]
+)
+
+sys.path.insert(
+    0,
+    str(PROJECT_ROOT / "code")
+)
+
+from utils.paths import (
+    UNCERTAINTY_RESULTS_DIR,
+    OOD_RESULTS_DIR
+)
+
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score
+)
+
+from scipy.stats import spearmanr
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+OOD_FILE = (
+    OOD_RESULTS_DIR
+    / "YCEO_OOD_ObservationResults.csv"
+)
+
+UNCERTAINTY_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_NestedUncertainty_ObservationResults.csv"
+)
+RANDOM_STATE = 42
+
+# Define a high-error observation as the top 20% of errors.
+HIGH_ERROR_QUANTILE = 0.80
+
+TOP_K_LEVELS = [
+    0.10,
+    0.20,
+    0.30
+]
+
+
+# ============================================================
+# LOAD
+# ============================================================
+
+print()
+print("============================================================")
+print("UNCERTAINTY VS OOD FAILURE DETECTION")
+print("============================================================")
+
+ood = pd.read_csv(
+    OOD_FILE
+)
+
+uncertainty = pd.read_csv(
+    UNCERTAINTY_FILE
+)
+
+print(
+    "OOD observations:",
+    len(ood)
+)
+
+print(
+    "Uncertainty observations:",
+    len(uncertainty)
+)
+
+
+# ============================================================
+# FIND OOD SCORE COLUMN
+# ============================================================
+
+possible_ood_scores = [
+    "OOD_Score",
+    "OOD_score",
+    "Mean_OOD_Score",
+    "IsolationForest_Score",
+    "OODScore"
+]
+
+ood_score_column = None
+
+for column in possible_ood_scores:
+
+    if column in ood.columns:
+
+        ood_score_column = column
+
+        break
+
+
+if ood_score_column is None:
+
+    candidates = [
+        c
+        for c in ood.columns
+        if "ood" in c.lower()
+        and pd.api.types.is_numeric_dtype(
+            ood[c]
+        )
+    ]
+
+    if len(candidates) == 0:
+
+        raise ValueError(
+            "Could not identify an OOD score column.\n"
+            "Available columns:\n"
+            + str(
+                ood.columns.tolist()
+            )
+        )
+
+    ood_score_column = candidates[0]
+
+
+print(
+    "OOD score column:",
+    ood_score_column
+)
+
+
+# ============================================================
+# CHECK UNCERTAINTY COLUMNS
+# ============================================================
+
+required_uncertainty = [
+    "Fold",
+    "Code",
+    "Observed",
+    "Predicted",
+    "Absolute_Error",
+    "Raw_Sigma",
+    "Calibrated_Sigma"
+]
+
+missing_uncertainty = [
+    c
+    for c in required_uncertainty
+    if c not in uncertainty.columns
+]
+
+if missing_uncertainty:
+
+    raise ValueError(
+        "Missing uncertainty columns: "
+        + str(
+            missing_uncertainty
+        )
+    )
+
+
+# ============================================================
+# CHECK OOD IDENTIFIERS
+# ============================================================
+
+required_ood = [
+    "Fold",
+    "Code"
+]
+
+missing_ood = [
+    c
+    for c in required_ood
+    if c not in ood.columns
+]
+
+if missing_ood:
+
+    raise ValueError(
+        "Missing OOD identifier columns: "
+        + str(
+            missing_ood
+        )
+    )
+
+
+# ============================================================
+# BUILD CLEAN OOD TABLE
+# ============================================================
+
+ood_clean = (
+    ood[
+        [
+            "Fold",
+            "Code",
+            ood_score_column
+        ]
+    ]
+    .copy()
+)
+
+
+ood_clean = (
+    ood_clean
+    .drop_duplicates(
+        subset=[
+            "Fold",
+            "Code"
+        ]
+    )
+)
+
+
+ood_clean = ood_clean.rename(
+    columns={
+        ood_score_column:
+            "OOD_Score"
+    }
+)
+
+
+# ============================================================
+# BUILD CLEAN UNCERTAINTY TABLE
+# ============================================================
+
+unc_clean = uncertainty[
+    [
+        "Fold",
+        "Code",
+        "Observed",
+        "Predicted",
+        "Absolute_Error",
+        "Raw_Sigma",
+        "Calibrated_Sigma"
+    ]
+].copy()
+
+
+unc_clean = (
+    unc_clean
+    .drop_duplicates(
+        subset=[
+            "Fold",
+            "Code"
+        ]
+    )
+)
+
+
+# ============================================================
+# MERGE
+# ============================================================
+
+merged = pd.merge(
+
+    unc_clean,
+
+    ood_clean,
+
+    on=[
+        "Fold",
+        "Code"
+    ],
+
+    how="inner"
+)
+
+
+print()
+print(
+    "Matched observations:",
+    len(merged)
+)
+
+
+if len(merged) == 0:
+
+    raise RuntimeError(
+        "No observations matched between OOD and "
+        "nested uncertainty files."
+    )
+
+
+# ============================================================
+# MISSING VALUE CHECK
+# ============================================================
+
+required_numeric = [
+    "Absolute_Error",
+    "Raw_Sigma",
+    "Calibrated_Sigma",
+    "OOD_Score"
+]
+
+
+missing_counts = (
+    merged[
+        required_numeric
+    ]
+    .isna()
+    .sum()
+)
+
+
+if missing_counts.sum() > 0:
+
+    print()
+    print(
+        "Missing values before filtering:"
+    )
+
+    print(
+        missing_counts
+        .to_string()
+    )
+
+
+    merged = merged.dropna(
+        subset=required_numeric
+    ).copy()
+
+
+print(
+    "Usable observations:",
+    len(merged)
+)
+
+
+# ============================================================
+# HIGH-ERROR LABEL
+# ============================================================
+#
+# Top 20% of actual prediction errors.
+# This label is ONLY used to evaluate detection.
+# No model is fitted with it.
+# ============================================================
+
+error_threshold = np.quantile(
+    merged[
+        "Absolute_Error"
+    ],
+    HIGH_ERROR_QUANTILE
+)
+
+
+merged[
+    "High_Error"
+] = (
+
+    merged[
+        "Absolute_Error"
+    ]
+    >=
+    error_threshold
+
+).astype(int)
+
+
+print()
+print("============================================================")
+print("HIGH-ERROR DEFINITION")
+print("============================================================")
+
+print(
+    "Absolute-error threshold:",
+    round(
+        error_threshold,
+        6
+    )
+)
+
+print(
+    "High-error observations:",
+    int(
+        merged["High_Error"].sum()
+    )
+)
+
+print(
+    "High-error prevalence:",
+    round(
+        merged["High_Error"].mean() * 100,
+        3
+    ),
+    "%"
+)
+
+
+# ============================================================
+# OOD SCORE DIRECTION
+# ============================================================
+#
+# Some anomaly scores use:
+#
+#   larger = more anomalous
+#
+# while others use:
+#
+#   smaller = more anomalous
+#
+# Test both directions.
+# ============================================================
+
+y_event = (
+    merged[
+        "High_Error"
+    ]
+    .to_numpy()
+)
+
+
+ood_values = (
+    merged[
+        "OOD_Score"
+    ]
+    .to_numpy()
+)
+
+
+ood_auc_positive = roc_auc_score(
+    y_event,
+    ood_values
+)
+
+
+ood_auc_negative = roc_auc_score(
+    y_event,
+    -ood_values
+)
+
+
+if (
+    ood_auc_positive
+    >=
+    ood_auc_negative
+):
+
+    ood_detection_score = (
+        ood_values
+    )
+
+    ood_direction = (
+        "higher_score_more_risk"
+    )
+
+    ood_auc = (
+        ood_auc_positive
+    )
+
+else:
+
+    ood_detection_score = (
+        -ood_values
+    )
+
+    ood_direction = (
+        "lower_score_more_risk"
+    )
+
+    ood_auc = (
+        ood_auc_negative
+    )
+
+
+print()
+print(
+    "OOD score direction:",
+    ood_direction
+)
+
+
+# ============================================================
+# UNCERTAINTY SCORES
+# ============================================================
+
+raw_uncertainty = (
+    merged[
+        "Raw_Sigma"
+    ]
+    .to_numpy()
+)
+
+
+calibrated_uncertainty = (
+    merged[
+        "Calibrated_Sigma"
+    ]
+    .to_numpy()
+)
+
+
+# ============================================================
+# AUROC
+# ============================================================
+
+raw_auc = roc_auc_score(
+    y_event,
+    raw_uncertainty
+)
+
+
+calibrated_auc = roc_auc_score(
+    y_event,
+    calibrated_uncertainty
+)
+
+
+# ============================================================
+# AUPRC
+# ============================================================
+
+ood_auprc = average_precision_score(
+    y_event,
+    ood_detection_score
+)
+
+
+raw_auprc = average_precision_score(
+    y_event,
+    raw_uncertainty
+)
+
+
+calibrated_auprc = average_precision_score(
+    y_event,
+    calibrated_uncertainty
+)
+
+
+# ============================================================
+# PRINT DETECTION PERFORMANCE
+# ============================================================
+
+print()
+print("============================================================")
+print("FAILURE DETECTION PERFORMANCE")
+print("============================================================")
+
+print(
+    "OOD AUROC:",
+    round(
+        ood_auc,
+        6
+    )
+)
+
+print(
+    "Raw uncertainty AUROC:",
+    round(
+        raw_auc,
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty AUROC:",
+    round(
+        calibrated_auc,
+        6
+    )
+)
+
+
+print()
+print(
+    "OOD AUPRC:",
+    round(
+        ood_auprc,
+        6
+    )
+)
+
+print(
+    "Raw uncertainty AUPRC:",
+    round(
+        raw_auprc,
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty AUPRC:",
+    round(
+        calibrated_auprc,
+        6
+    )
+)
+
+
+# ============================================================
+# SPEARMAN CORRELATION WITH ERROR
+# ============================================================
+
+ood_spearman, ood_spearman_p = (
+    spearmanr(
+        ood_detection_score,
+        merged[
+            "Absolute_Error"
+        ]
+    )
+)
+
+
+raw_spearman, raw_spearman_p = (
+    spearmanr(
+        raw_uncertainty,
+        merged[
+            "Absolute_Error"
+        ]
+    )
+)
+
+
+cal_spearman, cal_spearman_p = (
+    spearmanr(
+        calibrated_uncertainty,
+        merged[
+            "Absolute_Error"
+        ]
+    )
+)
+
+
+print()
+print("============================================================")
+print("SPEARMAN ASSOCIATION WITH ABSOLUTE ERROR")
+print("============================================================")
+
+print(
+    "OOD:",
+    round(
+        ood_spearman,
+        6
+    ),
+    "p =",
+    ood_spearman_p
+)
+
+print(
+    "Raw uncertainty:",
+    round(
+        raw_spearman,
+        6
+    ),
+    "p =",
+    raw_spearman_p
+)
+
+print(
+    "Calibrated uncertainty:",
+    round(
+        cal_spearman,
+        6
+    ),
+    "p =",
+    cal_spearman_p
+)
+
+
+# ============================================================
+# TOP-K PRECISION
+# ============================================================
+#
+# Select the highest-risk observations according to each
+# detector and measure how many are genuinely high-error.
+# ============================================================
+
+precision_rows = []
+
+
+for fraction in TOP_K_LEVELS:
+
+    n = max(
+        1,
+        int(
+            len(merged)
+            * fraction
+        )
+    )
+
+
+    def top_precision(
+        score
+    ):
+
+        order = np.argsort(
+            score
+        )[::-1]
+
+
+        selected = order[
+            :n
+        ]
+
+
+        return (
+            y_event[
+                selected
+            ]
+            .mean()
+        )
+
+
+    precision_rows.append({
+
+        "Top_Fraction":
+            fraction,
+
+        "Observations_Selected":
+            n,
+
+        "Base_High_Error_Prevalence":
+            y_event.mean(),
+
+        "OOD_Precision":
+            top_precision(
+                ood_detection_score
+            ),
+
+        "Raw_Uncertainty_Precision":
+            top_precision(
+                raw_uncertainty
+            ),
+
+        "Calibrated_Uncertainty_Precision":
+            top_precision(
+                calibrated_uncertainty
+            )
+    })
+
+
+precision_df = pd.DataFrame(
+    precision_rows
+)
+
+
+print()
+print("============================================================")
+print("TOP-K HIGH-ERROR PRECISION")
+print("============================================================")
+
+print(
+    precision_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# HIGH-ERROR RECALL / CAPTURE
+# ============================================================
+
+high_error_indices = np.where(
+    y_event == 1
+)[0]
+
+
+capture_rows = []
+
+
+for fraction in TOP_K_LEVELS:
+
+    n = max(
+        1,
+        int(
+            len(merged)
+            * fraction
+        )
+    )
+
+
+    def capture_rate(
+        score
+    ):
+
+        order = np.argsort(
+            score
+        )[::-1]
+
+
+        selected = set(
+            order[
+                :n
+            ]
+        )
+
+
+        captured = sum(
+            index in selected
+            for index in high_error_indices
+        )
+
+
+        return (
+            captured
+            /
+            len(
+                high_error_indices
+            )
+        )
+
+
+    capture_rows.append({
+
+        "Top_Fraction":
+            fraction,
+
+        "OOD_Recall":
+            capture_rate(
+                ood_detection_score
+            ),
+
+        "Raw_Uncertainty_Recall":
+            capture_rate(
+                raw_uncertainty
+            ),
+
+        "Calibrated_Uncertainty_Recall":
+            capture_rate(
+                calibrated_uncertainty
+            )
+    })
+
+
+capture_df = pd.DataFrame(
+    capture_rows
+)
+
+
+print()
+print("============================================================")
+print("HIGH-ERROR CAPTURE")
+print("============================================================")
+
+print(
+    capture_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# WITHIN-FOLD AUROC
+# ============================================================
+
+fold_rows = []
+
+
+for fold in sorted(
+    merged[
+        "Fold"
+    ].unique()
+):
+
+    temp = merged[
+        merged["Fold"]
+        ==
+        fold
+    ]
+
+
+    y_fold = (
+        temp[
+            "High_Error"
+        ]
+        .to_numpy()
+    )
+
+
+    if len(
+        np.unique(
+            y_fold
+        )
+    ) < 2:
+
+        continue
+
+
+    fold_ood_values = (
+        temp[
+            "OOD_Score"
+        ]
+        .to_numpy()
+    )
+
+
+    fold_auc_positive = (
+        roc_auc_score(
+            y_fold,
+            fold_ood_values
+        )
+    )
+
+
+    fold_auc_negative = (
+        roc_auc_score(
+            y_fold,
+            -fold_ood_values
+        )
+    )
+
+
+    fold_ood_auc = max(
+        fold_auc_positive,
+        fold_auc_negative
+    )
+
+
+    fold_raw_auc = (
+        roc_auc_score(
+            y_fold,
+            temp[
+                "Raw_Sigma"
+            ]
+        )
+    )
+
+
+    fold_calibrated_auc = (
+        roc_auc_score(
+            y_fold,
+            temp[
+                "Calibrated_Sigma"
+            ]
+        )
+    )
+
+
+    fold_rows.append({
+
+        "Fold":
+            fold,
+
+        "Observations":
+            len(temp),
+
+        "OOD_AUROC":
+            fold_ood_auc,
+
+        "Raw_Uncertainty_AUROC":
+            fold_raw_auc,
+
+        "Calibrated_Uncertainty_AUROC":
+            fold_calibrated_auc
+    })
+
+
+fold_df = pd.DataFrame(
+    fold_rows
+)
+
+
+print()
+print("============================================================")
+print("WITHIN-FOLD AUROC")
+print("============================================================")
+
+print(
+    fold_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# WITHIN-FOLD MEAN
+# ============================================================
+
+if len(fold_df) > 0:
+
+    print()
+    print(
+        "Mean within-fold OOD AUROC:",
+        round(
+            fold_df[
+                "OOD_AUROC"
+            ].mean(),
+            6
+        )
+    )
+
+    print(
+        "Mean within-fold raw "
+        "uncertainty AUROC:",
+        round(
+            fold_df[
+                "Raw_Uncertainty_AUROC"
+            ].mean(),
+            6
+        )
+    )
+
+    print(
+        "Mean within-fold calibrated "
+        "uncertainty AUROC:",
+        round(
+            fold_df[
+                "Calibrated_Uncertainty_AUROC"
+            ].mean(),
+            6
+        )
+    )
+
+
+# ============================================================
+# IMPROVEMENT OVER OOD
+# ============================================================
+
+print()
+print("============================================================")
+print("UNCERTAINTY IMPROVEMENT OVER OOD")
+print("============================================================")
+
+print(
+    "Raw AUROC improvement:",
+    round(
+        raw_auc - ood_auc,
+        6
+    )
+)
+
+print(
+    "Calibrated AUROC improvement:",
+    round(
+        calibrated_auc - ood_auc,
+        6
+    )
+)
+
+print(
+    "Raw AUPRC improvement:",
+    round(
+        raw_auprc - ood_auprc,
+        6
+    )
+)
+
+print(
+    "Calibrated AUPRC improvement:",
+    round(
+        calibrated_auprc - ood_auprc,
+        6
+    )
+)
+
+
+# ============================================================
+# DETECTION COMPARISON TABLE
+# ============================================================
+
+comparison_df = pd.DataFrame([
+
+    {
+        "Method":
+            "OOD",
+
+        "AUROC":
+            ood_auc,
+
+        "AUPRC":
+            ood_auprc,
+
+        "Spearman":
+            ood_spearman,
+
+        "Spearman_p":
+            ood_spearman_p
+    },
+
+    {
+        "Method":
+            "Raw_Uncertainty",
+
+        "AUROC":
+            raw_auc,
+
+        "AUPRC":
+            raw_auprc,
+
+        "Spearman":
+            raw_spearman,
+
+        "Spearman_p":
+            raw_spearman_p
+    },
+
+    {
+        "Method":
+            "Calibrated_Uncertainty",
+
+        "AUROC":
+            calibrated_auc,
+
+        "AUPRC":
+            calibrated_auprc,
+
+        "Spearman":
+            cal_spearman,
+
+        "Spearman_p":
+            cal_spearman_p
+    }
+])
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+merged.to_csv(
+    "YCEO_UncertaintyVsOOD_Merged.csv",
+    index=False
+)
+
+precision_df.to_csv(
+    "YCEO_UncertaintyVsOOD_TopKPrecision.csv",
+    index=False
+)
+
+capture_df.to_csv(
+    "YCEO_UncertaintyVsOOD_HighErrorCapture.csv",
+    index=False
+)
+
+fold_df.to_csv(
+    "YCEO_UncertaintyVsOOD_WithinFoldAUROC.csv",
+    index=False
+)
+
+comparison_df.to_csv(
+    "YCEO_UncertaintyVsOOD_Comparison.csv",
+    index=False
+)
+
+
+# ============================================================
+# FINAL
+# ============================================================
+
+print()
+print("============================================================")
+print("FILES CREATED")
+print("============================================================")
+
+print(
+    "YCEO_UncertaintyVsOOD_Merged.csv"
+)
+
+print(
+    "YCEO_UncertaintyVsOOD_TopKPrecision.csv"
+)
+
+print(
+    "YCEO_UncertaintyVsOOD_HighErrorCapture.csv"
+)
+
+print(
+    "YCEO_UncertaintyVsOOD_WithinFoldAUROC.csv"
+)
+
+print(
+    "YCEO_UncertaintyVsOOD_Comparison.csv"
+)
+
+print()
+print(
+    "Uncertainty vs OOD detection analysis complete."
+)
+============================================================
+FILE: .\code\uncertainty\uncertainty_vs_ood_significance.py
+============================================================
+import numpy as np
+import pandas as pd
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = (
+    Path(__file__).resolve().parents[2]
+)
+
+sys.path.insert(
+    0,
+    str(PROJECT_ROOT / "code")
+)
+
+from utils.paths import (
+    UNCERTAINTY_RESULTS_DIR
+)
+
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score
+)
+
+from scipy.stats import spearmanr
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+INPUT_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_UncertaintyVsOOD_Merged.csv"
+)
+
+RANDOM_STATE = 42
+
+N_BOOTSTRAPS = 5000
+N_PERMUTATIONS = 5000
+
+HIGH_ERROR_QUANTILE = 0.80
+
+TOP_K_LEVELS = [
+    0.10,
+    0.20,
+    0.30
+]
+
+
+# ============================================================
+# LOAD
+# ============================================================
+
+df = pd.read_csv(
+    INPUT_FILE
+)
+
+required = [
+    "Fold",
+    "Code",
+    "Absolute_Error",
+    "OOD_Score",
+    "Raw_Sigma",
+    "Calibrated_Sigma"
+]
+
+missing = [
+    c for c in required
+    if c not in df.columns
+]
+
+if missing:
+    raise ValueError(
+        "Missing columns: "
+        + str(missing)
+    )
+
+
+df = df.dropna(
+    subset=[
+        "Absolute_Error",
+        "OOD_Score",
+        "Raw_Sigma",
+        "Calibrated_Sigma"
+    ]
+).copy()
+
+
+print()
+print("============================================================")
+print("PAIRED SIGNIFICANCE TEST: UNCERTAINTY VS OOD")
+print("============================================================")
+
+print(
+    "Observations:",
+    len(df)
+)
+
+print(
+    "Folds:",
+    df["Fold"].nunique()
+)
+
+
+# ============================================================
+# HIGH-ERROR DEFINITION
+# ============================================================
+
+error_threshold = np.quantile(
+    df["Absolute_Error"],
+    HIGH_ERROR_QUANTILE
+)
+
+df["High_Error"] = (
+    df["Absolute_Error"]
+    >= error_threshold
+).astype(int)
+
+y = df["High_Error"].to_numpy()
+
+
+print()
+print("============================================================")
+print("HIGH-ERROR DEFINITION")
+print("============================================================")
+
+print(
+    "Threshold:",
+    round(
+        error_threshold,
+        6
+    )
+)
+
+print(
+    "High-error observations:",
+    int(y.sum())
+)
+
+print(
+    "Prevalence:",
+    round(
+        y.mean() * 100,
+        3
+    ),
+    "%"
+)
+
+
+# ============================================================
+# SCORE ARRAYS
+# ============================================================
+
+ood_values = df[
+    "OOD_Score"
+].to_numpy()
+
+raw_uncertainty = df[
+    "Raw_Sigma"
+].to_numpy()
+
+calibrated_uncertainty = df[
+    "Calibrated_Sigma"
+].to_numpy()
+
+
+# ============================================================
+# OOD SCORE DIRECTION
+# ============================================================
+
+auc_positive = roc_auc_score(
+    y,
+    ood_values
+)
+
+auc_negative = roc_auc_score(
+    y,
+    -ood_values
+)
+
+if auc_positive >= auc_negative:
+
+    ood_score = ood_values
+
+    ood_direction = (
+        "higher_score_more_risk"
+    )
+
+else:
+
+    ood_score = -ood_values
+
+    ood_direction = (
+        "lower_score_more_risk"
+    )
+
+
+# ============================================================
+# BASELINE PERFORMANCE
+# ============================================================
+
+ood_auc = roc_auc_score(
+    y,
+    ood_score
+)
+
+raw_auc = roc_auc_score(
+    y,
+    raw_uncertainty
+)
+
+calibrated_auc = roc_auc_score(
+    y,
+    calibrated_uncertainty
+)
+
+
+ood_auprc = average_precision_score(
+    y,
+    ood_score
+)
+
+raw_auprc = average_precision_score(
+    y,
+    raw_uncertainty
+)
+
+calibrated_auprc = average_precision_score(
+    y,
+    calibrated_uncertainty
+)
+
+
+observed_raw_auc_diff = (
+    raw_auc - ood_auc
+)
+
+observed_cal_auc_diff = (
+    calibrated_auc - ood_auc
+)
+
+observed_raw_auprc_diff = (
+    raw_auprc - ood_auprc
+)
+
+observed_cal_auprc_diff = (
+    calibrated_auprc - ood_auprc
+)
+
+
+print()
+print("============================================================")
+print("OBSERVED DETECTION PERFORMANCE")
+print("============================================================")
+
+print(
+    "OOD AUROC:",
+    round(
+        ood_auc,
+        6
+    )
+)
+
+print(
+    "Raw uncertainty AUROC:",
+    round(
+        raw_auc,
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty AUROC:",
+    round(
+        calibrated_auc,
+        6
+    )
+)
+
+print()
+
+print(
+    "OOD AUPRC:",
+    round(
+        ood_auprc,
+        6
+    )
+)
+
+print(
+    "Raw uncertainty AUPRC:",
+    round(
+        raw_auprc,
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty AUPRC:",
+    round(
+        calibrated_auprc,
+        6
+    )
+)
+
+print()
+
+print(
+    "OOD score direction:",
+    ood_direction
+)
+
+
+# ============================================================
+# SPEARMAN
+# ============================================================
+
+ood_spearman, ood_spearman_p = spearmanr(
+    ood_score,
+    df["Absolute_Error"]
+)
+
+raw_spearman, raw_spearman_p = spearmanr(
+    raw_uncertainty,
+    df["Absolute_Error"]
+)
+
+cal_spearman, cal_spearman_p = spearmanr(
+    calibrated_uncertainty,
+    df["Absolute_Error"]
+)
+
+
+# ============================================================
+# PAIRED BOOTSTRAP
+# ============================================================
+#
+# Every bootstrap sample resamples observations jointly.
+#
+# Therefore OOD, raw uncertainty and calibrated uncertainty
+# always remain paired with the same high-error labels.
+# ============================================================
+
+rng = np.random.default_rng(
+    RANDOM_STATE
+)
+
+bootstrap_raw_auc_diff = []
+bootstrap_cal_auc_diff = []
+
+bootstrap_raw_auprc_diff = []
+bootstrap_cal_auprc_diff = []
+
+
+n = len(df)
+
+
+for _ in range(
+    N_BOOTSTRAPS
+):
+
+    indices = rng.integers(
+        0,
+        n,
+        size=n
+    )
+
+    y_b = y[indices]
+
+    if len(
+        np.unique(y_b)
+    ) < 2:
+        continue
+
+    ood_b = ood_score[
+        indices
+    ]
+
+    raw_b = raw_uncertainty[
+        indices
+    ]
+
+    cal_b = calibrated_uncertainty[
+        indices
+    ]
+
+
+    auc_ood_b = roc_auc_score(
+        y_b,
+        ood_b
+    )
+
+    auc_raw_b = roc_auc_score(
+        y_b,
+        raw_b
+    )
+
+    auc_cal_b = roc_auc_score(
+        y_b,
+        cal_b
+    )
+
+
+    ap_ood_b = average_precision_score(
+        y_b,
+        ood_b
+    )
+
+    ap_raw_b = average_precision_score(
+        y_b,
+        raw_b
+    )
+
+    ap_cal_b = average_precision_score(
+        y_b,
+        cal_b
+    )
+
+
+    bootstrap_raw_auc_diff.append(
+        auc_raw_b - auc_ood_b
+    )
+
+    bootstrap_cal_auc_diff.append(
+        auc_cal_b - auc_ood_b
+    )
+
+    bootstrap_raw_auprc_diff.append(
+        ap_raw_b - ap_ood_b
+    )
+
+    bootstrap_cal_auprc_diff.append(
+        ap_cal_b - ap_ood_b
+    )
+
+
+bootstrap_raw_auc_diff = np.asarray(
+    bootstrap_raw_auc_diff
+)
+
+bootstrap_cal_auc_diff = np.asarray(
+    bootstrap_cal_auc_diff
+)
+
+bootstrap_raw_auprc_diff = np.asarray(
+    bootstrap_raw_auprc_diff
+)
+
+bootstrap_cal_auprc_diff = np.asarray(
+    bootstrap_cal_auprc_diff
+)
+
+
+# ============================================================
+# BOOTSTRAP CONFIDENCE INTERVAL
+# ============================================================
+
+def bootstrap_ci(
+    values
+):
+
+    lower = np.percentile(
+        values,
+        2.5
+    )
+
+    upper = np.percentile(
+        values,
+        97.5
+    )
+
+    return lower, upper
+
+
+raw_auc_ci = bootstrap_ci(
+    bootstrap_raw_auc_diff
+)
+
+cal_auc_ci = bootstrap_ci(
+    bootstrap_cal_auc_diff
+)
+
+raw_auprc_ci = bootstrap_ci(
+    bootstrap_raw_auprc_diff
+)
+
+cal_auprc_ci = bootstrap_ci(
+    bootstrap_cal_auprc_diff
+)
+
+
+# ============================================================
+# PAIRED PERMUTATION TEST
+# ============================================================
+#
+# For every observation, randomly swap which score is considered
+# detector A vs detector B.
+#
+# This preserves the paired structure.
+# ============================================================
+
+permutation_raw_auc = []
+permutation_cal_auc = []
+
+permutation_raw_auprc = []
+permutation_cal_auprc = []
+
+
+for _ in range(
+    N_PERMUTATIONS
+):
+
+    swap = (
+        rng.random(n)
+        < 0.5
+    )
+
+
+    # --------------------------------------------------------
+    # Raw uncertainty vs OOD
+    # --------------------------------------------------------
+
+    perm_raw = np.where(
+        swap,
+        ood_score,
+        raw_uncertainty
+    )
+
+    perm_ood = np.where(
+        swap,
+        raw_uncertainty,
+        ood_score
+    )
+
+
+    perm_auc_raw = (
+        roc_auc_score(
+            y,
+            perm_raw
+        )
+    )
+
+    perm_auc_ood = (
+        roc_auc_score(
+            y,
+            perm_ood
+        )
+    )
+
+
+    perm_ap_raw = (
+        average_precision_score(
+            y,
+            perm_raw
+        )
+    )
+
+    perm_ap_ood = (
+        average_precision_score(
+            y,
+            perm_ood
+        )
+    )
+
+
+    permutation_raw_auc.append(
+        perm_auc_raw - perm_auc_ood
+    )
+
+    permutation_raw_auprc.append(
+        perm_ap_raw - perm_ap_ood
+    )
+
+
+    # --------------------------------------------------------
+    # Calibrated uncertainty vs OOD
+    # --------------------------------------------------------
+
+    perm_cal = np.where(
+        swap,
+        ood_score,
+        calibrated_uncertainty
+    )
+
+    perm_ood_cal = np.where(
+        swap,
+        calibrated_uncertainty,
+        ood_score
+    )
+
+
+    perm_auc_cal = (
+        roc_auc_score(
+            y,
+            perm_cal
+        )
+    )
+
+    perm_auc_ood_cal = (
+        roc_auc_score(
+            y,
+            perm_ood_cal
+        )
+    )
+
+
+    perm_ap_cal = (
+        average_precision_score(
+            y,
+            perm_cal
+        )
+    )
+
+    perm_ap_ood_cal = (
+        average_precision_score(
+            y,
+            perm_ood_cal
+        )
+    )
+
+
+    permutation_cal_auc.append(
+        perm_auc_cal
+        - perm_auc_ood_cal
+    )
+
+    permutation_cal_auprc.append(
+        perm_ap_cal
+        - perm_ap_ood_cal
+    )
+
+
+permutation_raw_auc = np.asarray(
+    permutation_raw_auc
+)
+
+permutation_cal_auc = np.asarray(
+    permutation_cal_auc
+)
+
+permutation_raw_auprc = np.asarray(
+    permutation_raw_auprc
+)
+
+permutation_cal_auprc = np.asarray(
+    permutation_cal_auprc
+)
+
+
+# ============================================================
+# PERMUTATION P-VALUES
+# ============================================================
+
+raw_auc_p = np.mean(
+    np.abs(
+        permutation_raw_auc
+    )
+    >= abs(
+        observed_raw_auc_diff
+    )
+)
+
+cal_auc_p = np.mean(
+    np.abs(
+        permutation_cal_auc
+    )
+    >= abs(
+        observed_cal_auc_diff
+    )
+)
+
+raw_auprc_p = np.mean(
+    np.abs(
+        permutation_raw_auprc
+    )
+    >= abs(
+        observed_raw_auprc_diff
+    )
+)
+
+cal_auprc_p = np.mean(
+    np.abs(
+        permutation_cal_auprc
+    )
+    >= abs(
+        observed_cal_auprc_diff
+    )
+)
+
+
+# ============================================================
+# PRINT SIGNIFICANCE
+# ============================================================
+
+print()
+print("============================================================")
+print("PAIRED BOOTSTRAP + PERMUTATION RESULTS")
+print("============================================================")
+
+
+print()
+print("RAW UNCERTAINTY vs OOD")
+
+print(
+    "ΔAUROC:",
+    round(
+        observed_raw_auc_diff,
+        6
+    )
+)
+
+print(
+    "95% bootstrap CI:",
+    (
+        round(
+            raw_auc_ci[0],
+            6
+        ),
+        round(
+            raw_auc_ci[1],
+            6
+        )
+    )
+)
+
+print(
+    "Permutation p-value:",
+    raw_auc_p
+)
+
+
+print()
+
+print(
+    "ΔAUPRC:",
+    round(
+        observed_raw_auprc_diff,
+        6
+    )
+)
+
+print(
+    "95% bootstrap CI:",
+    (
+        round(
+            raw_auprc_ci[0],
+            6
+        ),
+        round(
+            raw_auprc_ci[1],
+            6
+        )
+    )
+)
+
+print(
+    "Permutation p-value:",
+    raw_auprc_p
+)
+
+
+print()
+print(
+    "CALIBRATED UNCERTAINTY vs OOD"
+)
+
+print(
+    "ΔAUROC:",
+    round(
+        observed_cal_auc_diff,
+        6
+    )
+)
+
+print(
+    "95% bootstrap CI:",
+    (
+        round(
+            cal_auc_ci[0],
+            6
+        ),
+        round(
+            cal_auc_ci[1],
+            6
+        )
+    )
+)
+
+print(
+    "Permutation p-value:",
+    cal_auc_p
+)
+
+
+print()
+
+print(
+    "ΔAUPRC:",
+    round(
+        observed_cal_auprc_diff,
+        6
+    )
+)
+
+print(
+    "95% bootstrap CI:",
+    (
+        round(
+            cal_auprc_ci[0],
+            6
+        ),
+        round(
+            cal_auprc_ci[1],
+            6
+        )
+    )
+)
+
+print(
+    "Permutation p-value:",
+    cal_auprc_p
+)
+
+
+# ============================================================
+# SPEARMAN RESULTS
+# ============================================================
+
+print()
+print("============================================================")
+print("ERROR ASSOCIATION")
+print("============================================================")
+
+print(
+    "OOD Spearman:",
+    round(
+        ood_spearman,
+        6
+    ),
+    "p =",
+    ood_spearman_p
+)
+
+print(
+    "Raw uncertainty Spearman:",
+    round(
+        raw_spearman,
+        6
+    ),
+    "p =",
+    raw_spearman_p
+)
+
+print(
+    "Calibrated uncertainty Spearman:",
+    round(
+        cal_spearman,
+        6
+    ),
+    "p =",
+    cal_spearman_p
+)
+
+
+# ============================================================
+# WITHIN-FOLD COMPARISON
+# ============================================================
+
+fold_rows = []
+
+
+for fold in sorted(
+    df["Fold"].unique()
+):
+
+    fold_df = df[
+        df["Fold"] == fold
+    ]
+
+
+    y_fold = (
+        fold_df[
+            "High_Error"
+        ]
+        .to_numpy()
+    )
+
+
+    if len(
+        np.unique(
+            y_fold
+        )
+    ) < 2:
+
+        continue
+
+
+    fold_ood_values = (
+        fold_df[
+            "OOD_Score"
+        ]
+        .to_numpy()
+    )
+
+
+    positive_auc = roc_auc_score(
+        y_fold,
+        fold_ood_values
+    )
+
+    negative_auc = roc_auc_score(
+        y_fold,
+        -fold_ood_values
+    )
+
+
+    if positive_auc >= negative_auc:
+
+        fold_ood_score = (
+            fold_ood_values
+        )
+
+    else:
+
+        fold_ood_score = (
+            -fold_ood_values
+        )
+
+
+    fold_raw = (
+        fold_df[
+            "Raw_Sigma"
+        ]
+        .to_numpy()
+    )
+
+    fold_cal = (
+        fold_df[
+            "Calibrated_Sigma"
+        ]
+        .to_numpy()
+    )
+
+
+    auc_ood_fold = roc_auc_score(
+        y_fold,
+        fold_ood_score
+    )
+
+    auc_raw_fold = roc_auc_score(
+        y_fold,
+        fold_raw
+    )
+
+    auc_cal_fold = roc_auc_score(
+        y_fold,
+        fold_cal
+    )
+
+
+    ap_ood_fold = average_precision_score(
+        y_fold,
+        fold_ood_score
+    )
+
+    ap_raw_fold = average_precision_score(
+        y_fold,
+        fold_raw
+    )
+
+    ap_cal_fold = average_precision_score(
+        y_fold,
+        fold_cal
+    )
+
+
+    fold_rows.append({
+
+        "Fold": fold,
+
+        "Observations": len(
+            fold_df
+        ),
+
+        "OOD_AUROC":
+            auc_ood_fold,
+
+        "Raw_Uncertainty_AUROC":
+            auc_raw_fold,
+
+        "Calibrated_Uncertainty_AUROC":
+            auc_cal_fold,
+
+        "Raw_Delta_AUROC":
+            auc_raw_fold
+            - auc_ood_fold,
+
+        "Calibrated_Delta_AUROC":
+            auc_cal_fold
+            - auc_ood_fold,
+
+        "OOD_AUPRC":
+            ap_ood_fold,
+
+        "Raw_Uncertainty_AUPRC":
+            ap_raw_fold,
+
+        "Calibrated_Uncertainty_AUPRC":
+            ap_cal_fold,
+
+        "Raw_Delta_AUPRC":
+            ap_raw_fold
+            - ap_ood_fold,
+
+        "Calibrated_Delta_AUPRC":
+            ap_cal_fold
+            - ap_ood_fold
+    })
+
+
+fold_df = pd.DataFrame(
+    fold_rows
+)
+
+
+print()
+print("============================================================")
+print("WITHIN-FOLD DETECTOR COMPARISON")
+print("============================================================")
+
+print(
+    fold_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# WIN COUNTS
+# ============================================================
+
+raw_auc_wins = int(
+    (
+        fold_df[
+            "Raw_Delta_AUROC"
+        ] > 0
+    ).sum()
+)
+
+cal_auc_wins = int(
+    (
+        fold_df[
+            "Calibrated_Delta_AUROC"
+        ] > 0
+    ).sum()
+)
+
+raw_ap_wins = int(
+    (
+        fold_df[
+            "Raw_Delta_AUPRC"
+        ] > 0
+    ).sum()
+)
+
+cal_ap_wins = int(
+    (
+        fold_df[
+            "Calibrated_Delta_AUPRC"
+        ] > 0
+    ).sum()
+)
+
+
+print()
+print("============================================================")
+print("WITHIN-FOLD WIN COUNTS")
+print("============================================================")
+
+print(
+    "Raw uncertainty AUROC wins:",
+    raw_auc_wins,
+    "/",
+    len(fold_df)
+)
+
+print(
+    "Calibrated uncertainty AUROC wins:",
+    cal_auc_wins,
+    "/",
+    len(fold_df)
+)
+
+print(
+    "Raw uncertainty AUPRC wins:",
+    raw_ap_wins,
+    "/",
+    len(fold_df)
+)
+
+print(
+    "Calibrated uncertainty AUPRC wins:",
+    cal_ap_wins,
+    "/",
+    len(fold_df)
+)
+
+
+# ============================================================
+# TOP-K PRECISION
+# ============================================================
+
+precision_rows = []
+
+
+for fraction in TOP_K_LEVELS:
+
+    n_top = max(
+        1,
+        int(
+            len(df)
+            * fraction
+        )
+    )
+
+
+    def precision_at_top(
+        score
+    ):
+
+        order = np.argsort(
+            score
+        )[::-1]
+
+        selected = order[
+            :n_top
+        ]
+
+        return (
+            y[selected]
+            .mean()
+        )
+
+
+    precision_rows.append({
+
+        "Top_Fraction":
+            fraction,
+
+        "OOD_Precision":
+            precision_at_top(
+                ood_score
+            ),
+
+        "Raw_Uncertainty_Precision":
+            precision_at_top(
+                raw_uncertainty
+            ),
+
+        "Calibrated_Uncertainty_Precision":
+            precision_at_top(
+                calibrated_uncertainty
+            )
+    })
+
+
+precision_df = pd.DataFrame(
+    precision_rows
+)
+
+
+print()
+print("============================================================")
+print("TOP-K PRECISION")
+print("============================================================")
+
+print(
+    precision_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# FINAL SUMMARY TABLE
+# ============================================================
+
+summary_rows = [
+
+    {
+        "Comparison":
+            "Raw_Uncertainty_minus_OOD",
+
+        "Metric":
+            "AUROC",
+
+        "OOD_Value":
+            ood_auc,
+
+        "Uncertainty_Value":
+            raw_auc,
+
+        "Difference":
+            observed_raw_auc_diff,
+
+        "CI_Low":
+            raw_auc_ci[0],
+
+        "CI_High":
+            raw_auc_ci[1],
+
+        "Permutation_p":
+            raw_auc_p
+    },
+
+    {
+        "Comparison":
+            "Raw_Uncertainty_minus_OOD",
+
+        "Metric":
+            "AUPRC",
+
+        "OOD_Value":
+            ood_auprc,
+
+        "Uncertainty_Value":
+            raw_auprc,
+
+        "Difference":
+            observed_raw_auprc_diff,
+
+        "CI_Low":
+            raw_auprc_ci[0],
+
+        "CI_High":
+            raw_auprc_ci[1],
+
+        "Permutation_p":
+            raw_auprc_p
+    },
+
+    {
+        "Comparison":
+            "Calibrated_Uncertainty_minus_OOD",
+
+        "Metric":
+            "AUROC",
+
+        "OOD_Value":
+            ood_auc,
+
+        "Uncertainty_Value":
+            calibrated_auc,
+
+        "Difference":
+            observed_cal_auc_diff,
+
+        "CI_Low":
+            cal_auc_ci[0],
+
+        "CI_High":
+            cal_auc_ci[1],
+
+        "Permutation_p":
+            cal_auc_p
+    },
+
+    {
+        "Comparison":
+            "Calibrated_Uncertainty_minus_OOD",
+
+        "Metric":
+            "AUPRC",
+
+        "OOD_Value":
+            ood_auprc,
+
+        "Uncertainty_Value":
+            calibrated_auprc,
+
+        "Difference":
+            observed_cal_auprc_diff,
+
+        "CI_Low":
+            cal_auprc_ci[0],
+
+        "CI_High":
+            cal_auprc_ci[1],
+
+        "Permutation_p":
+            cal_auprc_p
+    }
+]
+
+
+summary_df = pd.DataFrame(
+    summary_rows
+)
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+summary_df.to_csv(
+    "YCEO_UncertaintyVsOOD_Significance.csv",
+    index=False
+)
+
+fold_df.to_csv(
+    "YCEO_UncertaintyVsOOD_Significance_ByFold.csv",
+    index=False
+)
+
+precision_df.to_csv(
+    "YCEO_UncertaintyVsOOD_Significance_TopK.csv",
+    index=False
+)
+
+
+# ============================================================
+# SAVE TEXT REPORT
+# ============================================================
+
+report = []
+
+report.append(
+    "UNCERTAINTY VS OOD SIGNIFICANCE ANALYSIS"
+)
+
+report.append(
+    ""
+)
+
+report.append(
+    f"Observations: {len(df)}"
+)
+
+report.append(
+    f"High-error threshold: {error_threshold:.6f}"
+)
+
+report.append(
+    f"High-error prevalence: {y.mean() * 100:.3f}%"
+)
+
+report.append(
+    ""
+)
+
+report.append(
+    f"OOD AUROC: {ood_auc:.6f}"
+)
+
+report.append(
+    f"Raw uncertainty AUROC: {raw_auc:.6f}"
+)
+
+report.append(
+    f"Calibrated uncertainty AUROC: {calibrated_auc:.6f}"
+)
+
+report.append(
+    ""
+)
+
+report.append(
+    f"Raw uncertainty ΔAUROC: "
+    f"{observed_raw_auc_diff:.6f}"
+)
+
+report.append(
+    f"Raw uncertainty AUROC CI: "
+    f"[{raw_auc_ci[0]:.6f}, {raw_auc_ci[1]:.6f}]"
+)
+
+report.append(
+    f"Raw uncertainty AUROC permutation p: "
+    f"{raw_auc_p:.6f}"
+)
+
+report.append(
+    ""
+)
+
+report.append(
+    f"Calibrated uncertainty ΔAUROC: "
+    f"{observed_cal_auc_diff:.6f}"
+)
+
+report.append(
+    f"Calibrated uncertainty AUROC CI: "
+    f"[{cal_auc_ci[0]:.6f}, {cal_auc_ci[1]:.6f}]"
+)
+
+report.append(
+    f"Calibrated uncertainty AUROC permutation p: "
+    f"{cal_auc_p:.6f}"
+)
+
+report.append(
+    ""
+)
+
+report.append(
+    f"OOD AUPRC: {ood_auprc:.6f}"
+)
+
+report.append(
+    f"Raw uncertainty AUPRC: {raw_auprc:.6f}"
+)
+
+report.append(
+    f"Calibrated uncertainty AUPRC: "
+    f"{calibrated_auprc:.6f}"
+)
+
+report.append(
+    ""
+)
+
+report.append(
+    f"Raw uncertainty ΔAUPRC: "
+    f"{observed_raw_auprc_diff:.6f}"
+)
+
+report.append(
+    f"Raw uncertainty AUPRC CI: "
+    f"[{raw_auprc_ci[0]:.6f}, "
+    f"{raw_auprc_ci[1]:.6f}]"
+)
+
+report.append(
+    f"Raw uncertainty AUPRC permutation p: "
+    f"{raw_auprc_p:.6f}"
+)
+
+report.append(
+    ""
+)
+
+report.append(
+    f"Calibrated uncertainty ΔAUPRC: "
+    f"{observed_cal_auprc_diff:.6f}"
+)
+
+report.append(
+    f"Calibrated uncertainty AUPRC CI: "
+    f"[{cal_auprc_ci[0]:.6f}, "
+    f"{cal_auprc_ci[1]:.6f}]"
+)
+
+report.append(
+    f"Calibrated uncertainty AUPRC permutation p: "
+    f"{cal_auprc_p:.6f}"
+)
+
+report.append(
+    ""
+)
+
+report.append(
+    f"OOD Spearman: {ood_spearman:.6f}"
+)
+
+report.append(
+    f"Raw uncertainty Spearman: "
+    f"{raw_spearman:.6f}"
+)
+
+report.append(
+    f"Calibrated uncertainty Spearman: "
+    f"{cal_spearman:.6f}"
+)
+
+
+with open(
+    "YCEO_UncertaintyVsOOD_Significance_Report.txt",
+    "w",
+    encoding="utf-8"
+) as f:
+
+    f.write(
+        "\n".join(report)
+    )
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print()
+print("============================================================")
+print("FILES CREATED")
+print("============================================================")
+
+print(
+    "YCEO_UncertaintyVsOOD_Significance.csv"
+)
+
+print(
+    "YCEO_UncertaintyVsOOD_Significance_ByFold.csv"
+)
+
+print(
+    "YCEO_UncertaintyVsOOD_Significance_TopK.csv"
+)
+
+print(
+    "YCEO_UncertaintyVsOOD_Significance_Report.txt"
+)
+
+print()
+print(
+    "Paired detector significance analysis complete."
+)
+============================================================
+FILE: .\code\uncertainty\selective_prediction_benchmark.py
+============================================================
+import numpy as np
+import pandas as pd
+
+from utils.paths import (
+    UNCERTAINTY_RESULTS_DIR
+)
+
+from sklearn.metrics import roc_auc_score
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+INPUT_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_UncertaintyVsOOD_Merged.csv"
+)
+
+RANDOM_STATE = 42
+
+COVERAGE_LEVELS = [
+    1.00,
+    0.95,
+    0.90,
+    0.80,
+    0.70,
+    0.60,
+    0.50,
+    0.40,
+    0.30
+]
+
+HIGH_ERROR_QUANTILE = 0.80
+
+
+# ============================================================
+# LOAD
+# ============================================================
+
+df = pd.read_csv(
+    INPUT_FILE
+)
+
+
+required = [
+    "Fold",
+    "Code",
+    "Observed",
+    "Predicted",
+    "Absolute_Error",
+    "OOD_Score",
+    "Raw_Sigma",
+    "Calibrated_Sigma"
+]
+
+
+missing = [
+    c for c in required
+    if c not in df.columns
+]
+
+
+if missing:
+
+    raise ValueError(
+        "Missing columns: "
+        + str(missing)
+    )
+
+
+df = df.dropna(
+    subset=[
+        "Observed",
+        "Predicted",
+        "Absolute_Error",
+        "OOD_Score",
+        "Raw_Sigma",
+        "Calibrated_Sigma"
+    ]
+).copy()
+
+
+print()
+print("============================================================")
+print("SELECTIVE PREDICTION BENCHMARK")
+print("============================================================")
+
+print(
+    "Observations:",
+    len(df)
+)
+
+print(
+    "Folds:",
+    df["Fold"].nunique()
+)
+
+
+# ============================================================
+# HIGH-ERROR DEFINITION
+# ============================================================
+
+high_error_threshold = np.quantile(
+    df["Absolute_Error"],
+    HIGH_ERROR_QUANTILE
+)
+
+
+df["High_Error"] = (
+    df["Absolute_Error"]
+    >= high_error_threshold
+).astype(int)
+
+
+print()
+print("============================================================")
+print("HIGH-ERROR DEFINITION")
+print("============================================================")
+
+print(
+    "Threshold:",
+    round(
+        high_error_threshold,
+        6
+    )
+)
+
+print(
+    "High-error prevalence:",
+    round(
+        df["High_Error"].mean() * 100,
+        3
+    ),
+    "%"
+)
+
+
+# ============================================================
+# OOD SCORE DIRECTION
+# ============================================================
+
+y_event = df[
+    "High_Error"
+].to_numpy()
+
+
+ood_values = df[
+    "OOD_Score"
+].to_numpy()
+
+
+auc_positive = roc_auc_score(
+    y_event,
+    ood_values
+)
+
+
+auc_negative = roc_auc_score(
+    y_event,
+    -ood_values
+)
+
+
+if auc_positive >= auc_negative:
+
+    ood_risk = ood_values
+
+    ood_direction = (
+        "higher_score_more_risk"
+    )
+
+else:
+
+    ood_risk = -ood_values
+
+    ood_direction = (
+        "lower_score_more_risk"
+    )
+
+
+raw_risk = df[
+    "Raw_Sigma"
+].to_numpy()
+
+
+calibrated_risk = df[
+    "Calibrated_Sigma"
+].to_numpy()
+
+
+# ============================================================
+# ALL-PREDICTION BASELINE
+# ============================================================
+
+baseline_mae = df[
+    "Absolute_Error"
+].mean()
+
+
+baseline_rmse = np.sqrt(
+    np.mean(
+        (
+            df["Observed"].to_numpy()
+            -
+            df["Predicted"].to_numpy()
+        ) ** 2
+    )
+)
+
+
+print()
+print("============================================================")
+print("FULL-COVERAGE BASELINE")
+print("============================================================")
+
+print(
+    "MAE:",
+    round(
+        baseline_mae,
+        6
+    )
+)
+
+print(
+    "RMSE:",
+    round(
+        baseline_rmse,
+        6
+    )
+)
+
+
+# ============================================================
+# SELECTIVE RISK FUNCTION
+# ============================================================
+#
+# Higher score = more risk.
+#
+# For a requested coverage c:
+#
+#   keep the lowest-risk c fraction
+#
+#   reject the highest-risk (1-c) fraction
+#
+# ============================================================
+
+def evaluate_selective_risk(
+    score,
+    coverage
+):
+
+    n = len(score)
+
+
+    n_keep = max(
+        1,
+        int(
+            np.floor(
+                n * coverage
+            )
+        )
+    )
+
+
+    order = np.argsort(
+        score
+    )
+
+
+    retained_indices = order[
+        :n_keep
+    ]
+
+
+    rejected_indices = order[
+        n_keep:
+    ]
+
+
+    retained = df.iloc[
+        retained_indices
+    ]
+
+
+    rejected = df.iloc[
+        rejected_indices
+    ]
+
+
+    retained_mae = retained[
+        "Absolute_Error"
+    ].mean()
+
+
+    retained_rmse = np.sqrt(
+        np.mean(
+            (
+                retained[
+                    "Observed"
+                ].to_numpy()
+                -
+                retained[
+                    "Predicted"
+                ].to_numpy()
+            ) ** 2
+        )
+    )
+
+
+    rejected_mae = np.nan
+
+    rejected_rmse = np.nan
+
+
+    if len(rejected) > 0:
+
+        rejected_mae = rejected[
+            "Absolute_Error"
+        ].mean()
+
+
+        rejected_rmse = np.sqrt(
+            np.mean(
+                (
+                    rejected[
+                        "Observed"
+                    ].to_numpy()
+                    -
+                    rejected[
+                        "Predicted"
+                    ].to_numpy()
+                ) ** 2
+            )
+        )
+
+
+    error_reduction = (
+        (
+            baseline_mae
+            -
+            retained_mae
+        )
+        /
+        baseline_mae
+        *
+        100
+    )
+
+
+    return {
+        "Coverage":
+            coverage,
+
+        "Retained_Observations":
+            len(retained),
+
+        "Rejected_Observations":
+            len(rejected),
+
+        "Selective_MAE":
+            retained_mae,
+
+        "Selective_RMSE":
+            retained_rmse,
+
+        "Rejected_MAE":
+            rejected_mae,
+
+        "Rejected_RMSE":
+            rejected_rmse,
+
+        "MAE_Reduction_Percent":
+            error_reduction
+    }
+
+
+# ============================================================
+# BUILD SELECTIVE RISK TABLE
+# ============================================================
+
+rows = []
+
+
+for coverage in COVERAGE_LEVELS:
+
+    ood_result = evaluate_selective_risk(
+        ood_risk,
+        coverage
+    )
+
+
+    raw_result = evaluate_selective_risk(
+        raw_risk,
+        coverage
+    )
+
+
+    calibrated_result = evaluate_selective_risk(
+        calibrated_risk,
+        coverage
+    )
+
+
+    rows.append({
+
+        "Coverage":
+            coverage,
+
+        "Retained_Observations":
+            ood_result[
+                "Retained_Observations"
+            ],
+
+        "OOD_MAE":
+            ood_result[
+                "Selective_MAE"
+            ],
+
+        "Raw_Uncertainty_MAE":
+            raw_result[
+                "Selective_MAE"
+            ],
+
+        "Calibrated_Uncertainty_MAE":
+            calibrated_result[
+                "Selective_MAE"
+            ],
+
+        "OOD_RMSE":
+            ood_result[
+                "Selective_RMSE"
+            ],
+
+        "Raw_Uncertainty_RMSE":
+            raw_result[
+                "Selective_RMSE"
+            ],
+
+        "Calibrated_Uncertainty_RMSE":
+            calibrated_result[
+                "Selective_RMSE"
+            ],
+
+        "OOD_MAE_Reduction_Percent":
+            ood_result[
+                "MAE_Reduction_Percent"
+            ],
+
+        "Raw_Uncertainty_MAE_Reduction_Percent":
+            raw_result[
+                "MAE_Reduction_Percent"
+            ],
+
+        "Calibrated_Uncertainty_MAE_Reduction_Percent":
+            calibrated_result[
+                "MAE_Reduction_Percent"
+            ]
+    })
+
+
+selective_df = pd.DataFrame(
+    rows
+)
+
+
+print()
+print("============================================================")
+print("SELECTIVE RISK")
+print("============================================================")
+
+print(
+    selective_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# ERROR REJECTION
+# ============================================================
+#
+# For each rejection fraction:
+#
+#   how much of the total high-error population is removed?
+#
+# ============================================================
+
+capture_rows = []
+
+
+for coverage in COVERAGE_LEVELS:
+
+    rejection_fraction = (
+        1.0 - coverage
+    )
+
+
+    n_reject = int(
+        np.floor(
+            len(df)
+            * rejection_fraction
+        )
+    )
+
+
+    if n_reject == 0:
+
+        continue
+
+
+    def evaluate_rejection(
+        score
+    ):
+
+        order = np.argsort(
+            score
+        )[::-1
+        ]
+
+        rejected_indices = order[
+            :n_reject
+        ]
+
+
+        rejected = df.iloc[
+            rejected_indices
+        ]
+
+
+        high_error_removed = (
+            rejected[
+                "High_Error"
+            ].sum()
+        )
+
+
+        total_high_error = (
+            df["High_Error"].sum()
+        )
+
+
+        high_error_recall = (
+            high_error_removed
+            /
+            total_high_error
+        )
+
+
+        return {
+            "Rejected":
+                len(rejected),
+
+            "Rejected_MAE":
+                rejected[
+                    "Absolute_Error"
+                ].mean(),
+
+            "High_Error_Recall":
+                high_error_recall
+        }
+
+
+    ood_result = evaluate_rejection(
+        ood_risk
+    )
+
+
+    raw_result = evaluate_rejection(
+        raw_risk
+    )
+
+
+    calibrated_result = evaluate_rejection(
+        calibrated_risk
+    )
+
+
+    capture_rows.append({
+
+        "Coverage":
+            coverage,
+
+        "Rejection_Percent":
+            rejection_fraction * 100,
+
+        "OOD_Rejected_MAE":
+            ood_result[
+                "Rejected_MAE"
+            ],
+
+        "Raw_Uncertainty_Rejected_MAE":
+            raw_result[
+                "Rejected_MAE"
+            ],
+
+        "Calibrated_Uncertainty_Rejected_MAE":
+            calibrated_result[
+                "Rejected_MAE"
+            ],
+
+        "OOD_High_Error_Recall":
+            ood_result[
+                "High_Error_Recall"
+            ],
+
+        "Raw_Uncertainty_High_Error_Recall":
+            raw_result[
+                "High_Error_Recall"
+            ],
+
+        "Calibrated_Uncertainty_High_Error_Recall":
+            calibrated_result[
+                "High_Error_Recall"
+            ]
+    })
+
+
+capture_df = pd.DataFrame(
+    capture_rows
+)
+
+
+print()
+print("============================================================")
+print("ERROR REJECTION")
+print("============================================================")
+
+print(
+    capture_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# EFFICIENCY OF REJECTION
+# ============================================================
+#
+# Fraction of all absolute error removed per fraction of
+# observations rejected.
+# ============================================================
+
+efficiency_rows = []
+
+
+total_absolute_error = (
+    df["Absolute_Error"]
+    .sum()
+)
+
+
+for coverage in COVERAGE_LEVELS:
+
+    rejection_fraction = (
+        1.0 - coverage
+    )
+
+
+    n_reject = int(
+        np.floor(
+            len(df)
+            * rejection_fraction
+        )
+    )
+
+
+    if n_reject == 0:
+
+        continue
+
+
+    def error_capture(
+        score
+    ):
+
+        order = np.argsort(
+            score
+        )[::-1
+        ]
+
+        rejected = df.iloc[
+            order[
+                :n_reject
+            ]
+        ]
+
+
+        error_removed = (
+            rejected[
+                "Absolute_Error"
+            ].sum()
+        )
+
+
+        share = (
+            error_removed
+            /
+            total_absolute_error
+        )
+
+
+        return share
+
+
+    efficiency_rows.append({
+
+        "Coverage":
+            coverage,
+
+        "Rejection_Percent":
+            rejection_fraction * 100,
+
+        "OOD_Error_Share_Removed":
+            error_capture(
+                ood_risk
+            ),
+
+        "Raw_Uncertainty_Error_Share_Removed":
+            error_capture(
+                raw_risk
+            ),
+
+        "Calibrated_Uncertainty_Error_Share_Removed":
+            error_capture(
+                calibrated_risk
+            )
+    })
+
+
+efficiency_df = pd.DataFrame(
+    efficiency_rows
+)
+
+
+print()
+print("============================================================")
+print("ERROR CAPTURE EFFICIENCY")
+print("============================================================")
+
+print(
+    efficiency_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# WITHIN-FOLD SELECTIVE PERFORMANCE
+# ============================================================
+#
+# Repeat the risk-coverage analysis independently in each
+# spatial fold.
+# ============================================================
+
+fold_rows = []
+
+
+for fold in sorted(
+    df["Fold"].unique()
+):
+
+    fold_df = df[
+        df["Fold"] == fold
+    ].copy()
+
+
+    fold_ood = (
+        fold_df[
+            "OOD_Score"
+        ].to_numpy()
+    )
+
+
+    fold_y = (
+        fold_df[
+            "High_Error"
+        ].to_numpy()
+    )
+
+
+    # Determine OOD direction inside the fold.
+
+    pos = roc_auc_score(
+        fold_y,
+        fold_ood
+    )
+
+    neg = roc_auc_score(
+        fold_y,
+        -fold_ood
+    )
+
+
+    if pos >= neg:
+
+        fold_ood_risk = fold_ood
+
+    else:
+
+        fold_ood_risk = -fold_ood
+
+
+    fold_raw = (
+        fold_df[
+            "Raw_Sigma"
+        ].to_numpy()
+    )
+
+
+    fold_cal = (
+        fold_df[
+            "Calibrated_Sigma"
+        ].to_numpy()
+    )
+
+
+    coverage = 0.80
+
+
+    n_keep = max(
+        1,
+        int(
+            len(fold_df)
+            * coverage
+        )
+    )
+
+
+    def fold_selective_mae(
+        score
+    ):
+
+        order = np.argsort(
+            score
+        )
+
+        selected = order[
+            :n_keep
+        ]
+
+        return fold_df.iloc[
+            selected
+        ][
+            "Absolute_Error"
+        ].mean()
+
+
+    fold_rows.append({
+
+        "Fold":
+            fold,
+
+        "Coverage":
+            coverage,
+
+        "OOD_MAE":
+            fold_selective_mae(
+                fold_ood_risk
+            ),
+
+        "Raw_Uncertainty_MAE":
+            fold_selective_mae(
+                fold_raw
+            ),
+
+        "Calibrated_Uncertainty_MAE":
+            fold_selective_mae(
+                fold_cal
+            )
+    })
+
+
+fold_selective_df = pd.DataFrame(
+    fold_rows
+)
+
+
+print()
+print("============================================================")
+print("WITHIN-FOLD SELECTIVE RISK AT 80% COVERAGE")
+print("============================================================")
+
+print(
+    fold_selective_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# MEAN WITHIN-FOLD REDUCTION
+# ============================================================
+
+fold_baseline_mae = []
+
+
+for fold in sorted(
+    df["Fold"].unique()
+):
+
+    temp = df[
+        df["Fold"] == fold
+    ]
+
+    fold_baseline_mae.append(
+        temp[
+            "Absolute_Error"
+        ].mean()
+    )
+
+
+fold_selective_df[
+    "Baseline_MAE"
+] = fold_basive_mae if False else np.nan
+
+
+# Recompute safely.
+
+baseline_map = {}
+
+
+for fold in sorted(
+    df["Fold"].unique()
+):
+
+    temp = df[
+        df["Fold"] == fold
+    ]
+
+    baseline_map[
+        fold
+    ] = temp[
+        "Absolute_Error"
+    ].mean()
+
+
+fold_selective_df[
+    "Baseline_MAE"
+] = fold_selective_df[
+    "Fold"
+].map(
+    baseline_map
+)
+
+
+fold_selective_df[
+    "OOD_Reduction_Percent"
+] = (
+    (
+        fold_selective_df[
+            "Baseline_MAE"
+        ]
+        -
+        fold_selective_df[
+            "OOD_MAE"
+        ]
+    )
+    /
+    fold_selective_df[
+        "Baseline_MAE"
+    ]
+    * 100
+)
+
+
+fold_selective_df[
+    "Raw_Uncertainty_Reduction_Percent"
+] = (
+    (
+        fold_selective_df[
+            "Baseline_MAE"
+        ]
+        -
+        fold_selective_df[
+            "Raw_Uncertainty_MAE"
+        ]
+    )
+    /
+    fold_selective_df[
+        "Baseline_MAE"
+    ]
+    * 100
+)
+
+
+fold_selective_df[
+    "Calibrated_Uncertainty_Reduction_Percent"
+] = (
+    (
+        fold_selective_df[
+            "Baseline_MAE"
+        ]
+        -
+        fold_selective_df[
+            "Calibrated_Uncertainty_MAE"
+        ]
+    )
+    /
+    fold_selective_df[
+        "Baseline_MAE"
+    ]
+    * 100
+)
+
+
+print()
+print("============================================================")
+print("WITHIN-FOLD MAE REDUCTION")
+print("============================================================")
+
+print(
+    fold_selective_df[
+        [
+            "Fold",
+            "OOD_Reduction_Percent",
+            "Raw_Uncertainty_Reduction_Percent",
+            "Calibrated_Uncertainty_Reduction_Percent"
+        ]
+    ].to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+summary = pd.DataFrame({
+
+    "Metric": [
+        "Full_Coverage_MAE",
+        "80pct_Coverage_OOD_MAE",
+        "80pct_Coverage_Raw_Uncertainty_MAE",
+        "80pct_Coverage_Calibrated_Uncertainty_MAE",
+        "50pct_Coverage_OOD_MAE",
+        "50pct_Coverage_Raw_Uncertainty_MAE",
+        "50pct_Coverage_Calibrated_Uncertainty_MAE"
+    ],
+
+    "Value": [
+
+        baseline_mae,
+
+        selective_df.loc[
+            selective_df["Coverage"] == 0.80,
+            "OOD_MAE"
+        ].iloc[0],
+
+        selective_df.loc[
+            selective_df["Coverage"] == 0.80,
+            "Raw_Uncertainty_MAE"
+        ].iloc[0],
+
+        selective_df.loc[
+            selective_df["Coverage"] == 0.80,
+            "Calibrated_Uncertainty_MAE"
+        ].iloc[0],
+
+        selective_df.loc[
+            selective_df["Coverage"] == 0.50,
+            "OOD_MAE"
+        ].iloc[0],
+
+        selective_df.loc[
+            selective_df["Coverage"] == 0.50,
+            "Raw_Uncertainty_MAE"
+        ].iloc[0],
+
+        selective_df.loc[
+            selective_df["Coverage"] == 0.50,
+            "Calibrated_Uncertainty_MAE"
+        ].iloc[0]
+    ]
+})
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+selective_df.to_csv(
+    "YCEO_SelectivePrediction_RiskCoverage.csv",
+    index=False
+)
+
+capture_df.to_csv(
+    "YCEO_SelectivePrediction_ErrorRejection.csv",
+    index=False
+)
+
+efficiency_df.to_csv(
+    "YCEO_SelectivePrediction_ErrorCaptureEfficiency.csv",
+    index=False
+)
+
+fold_selective_df.to_csv(
+    "YCEO_SelectivePrediction_WithinFold.csv",
+    index=False
+)
+
+summary.to_csv(
+    "YCEO_SelectivePrediction_Summary.csv",
+    index=False
+)
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print()
+print("============================================================")
+print("FILES CREATED")
+print("============================================================")
+
+print(
+    "YCEO_SelectivePrediction_RiskCoverage.csv"
+)
+
+print(
+    "YCEO_SelectivePrediction_ErrorRejection.csv"
+)
+
+print(
+    "YCEO_SelectivePrediction_ErrorCaptureEfficiency.csv"
+)
+
+print(
+    "YCEO_SelectivePrediction_WithinFold.csv"
+)
+
+print(
+    "YCEO_SelectivePrediction_Summary.csv"
+)
+
+print()
+print(
+    "Selective prediction benchmark complete."
+)
+============================================================
+FILE: .\code\uncertainty\aurc_benchmark.py
+============================================================
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import roc_auc_score
+from utils.paths import (
+    UNCERTAINTY_RESULTS_DIR
+)
+
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+INPUT_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_UncertaintyVsOOD_Merged.csv"
+)
+
+HIGH_ERROR_QUANTILE = 0.80
+
+RANDOM_STATE = 42
+
+
+# ============================================================
+# LOAD
+# ============================================================
+
+df = pd.read_csv(
+    INPUT_FILE
+)
+
+
+required = [
+    "Fold",
+    "Code",
+    "Observed",
+    "Predicted",
+    "Absolute_Error",
+    "OOD_Score",
+    "Raw_Sigma",
+    "Calibrated_Sigma"
+]
+
+
+missing = [
+    c
+    for c in required
+    if c not in df.columns
+]
+
+
+if missing:
+
+    raise ValueError(
+        "Missing columns: "
+        + str(missing)
+    )
+
+
+df = df.dropna(
+    subset=[
+        "Observed",
+        "Predicted",
+        "Absolute_Error",
+        "OOD_Score",
+        "Raw_Sigma",
+        "Calibrated_Sigma"
+    ]
+).copy()
+
+
+# ============================================================
+# HIGH-ERROR EVENT
+# ============================================================
+
+error_threshold = np.quantile(
+    df["Absolute_Error"],
+    HIGH_ERROR_QUANTILE
+)
+
+
+df["High_Error"] = (
+    df["Absolute_Error"]
+    >= error_threshold
+).astype(int)
+
+
+print()
+print("============================================================")
+print("AURC SELECTIVE-RISK BENCHMARK")
+print("============================================================")
+
+print(
+    "Observations:",
+    len(df)
+)
+
+print(
+    "Folds:",
+    df["Fold"].nunique()
+)
+
+print(
+    "High-error threshold:",
+    round(
+        error_threshold,
+        6
+    )
+)
+
+
+# ============================================================
+# OOD DIRECTION
+# ============================================================
+
+def get_ood_risk(
+    y_event,
+    ood_values
+):
+
+    positive_auc = roc_auc_score(
+        y_event,
+        ood_values
+    )
+
+    negative_auc = roc_auc_score(
+        y_event,
+        -ood_values
+    )
+
+    if positive_auc >= negative_auc:
+
+        return (
+            ood_values,
+            "higher_score_more_risk"
+        )
+
+    return (
+        -ood_values,
+        "lower_score_more_risk"
+    )
+
+
+# ============================================================
+# AURC CALCULATION
+# ============================================================
+#
+# For every possible retained observation:
+#
+#   rank by risk
+#   retain the lowest-risk observations
+#   calculate selective MAE
+#
+# We then integrate risk over coverage using the trapezoidal
+# rule.
+#
+# At full coverage the risk equals ordinary MAE.
+# ============================================================
+
+def calculate_aurc(
+    errors,
+    risk
+):
+
+    n = len(errors)
+
+    order = np.argsort(
+        risk
+    )
+
+    sorted_errors = errors[
+        order
+    ]
+
+
+    cumulative_error = np.cumsum(
+        sorted_errors
+    )
+
+
+    cumulative_n = np.arange(
+        1,
+        n + 1
+    )
+
+
+    coverage = (
+        cumulative_n
+        /
+        n
+    )
+
+
+    selective_risk = (
+        cumulative_error
+        /
+        cumulative_n
+    )
+
+
+    # Add the zero-coverage origin.
+    coverage_curve = np.concatenate(
+        [
+            np.array([0.0]),
+            coverage
+        ]
+    )
+
+
+    risk_curve = np.concatenate(
+        [
+            np.array([
+                selective_risk[0]
+            ]),
+            selective_risk
+        ]
+    )
+
+
+    aurc = np.trapezoid(
+        risk_curve,
+        coverage_curve
+    )
+
+
+    return (
+        aurc,
+        coverage_curve,
+        risk_curve
+    )
+
+
+# ============================================================
+# FOLD-LEVEL AURC
+# ============================================================
+
+fold_rows = []
+
+curve_rows = []
+
+
+for fold in sorted(
+    df["Fold"].unique()
+):
+
+    fold_df = df[
+        df["Fold"] == fold
+    ].copy()
+
+
+    errors = (
+        fold_df[
+            "Absolute_Error"
+        ]
+        .to_numpy()
+    )
+
+
+    y_event = (
+        fold_df[
+            "High_Error"
+        ]
+        .to_numpy()
+    )
+
+
+    ood_values = (
+        fold_df[
+            "OOD_Score"
+        ]
+        .to_numpy()
+    )
+
+
+    # --------------------------------------------------------
+    # Determine OOD risk direction independently within fold.
+    # --------------------------------------------------------
+
+    ood_risk, ood_direction = (
+        get_ood_risk(
+            y_event,
+            ood_values
+        )
+    )
+
+
+    raw_risk = (
+        fold_df[
+            "Raw_Sigma"
+        ]
+        .to_numpy()
+    )
+
+
+    calibrated_risk = (
+        fold_df[
+            "Calibrated_Sigma"
+        ]
+        .to_numpy()
+    )
+
+
+    # --------------------------------------------------------
+    # Calculate AURC.
+    # --------------------------------------------------------
+
+    ood_aurc, ood_cov, ood_risk_curve = (
+        calculate_aurc(
+            errors,
+            ood_risk
+        )
+    )
+
+
+    raw_aurc, raw_cov, raw_risk_curve = (
+        calculate_aurc(
+            errors,
+            raw_risk
+        )
+    )
+
+
+    cal_aurc, cal_cov, cal_risk_curve = (
+        calculate_aurc(
+            errors,
+            calibrated_risk
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Oracle AURC.
+    #
+    # This ranks observations by their ACTUAL future error.
+    # It is only a theoretical lower-bound reference.
+    # It must never be presented as an achievable predictor.
+    # --------------------------------------------------------
+
+    oracle_risk = errors.copy()
+
+
+    oracle_aurc, _, _ = calculate_aurc(
+        errors,
+        oracle_risk
+    )
+
+
+    # --------------------------------------------------------
+    # Random-ranking reference.
+    # Expected approximate AURC for random selection is related
+    # to the full-sample mean error.
+    # --------------------------------------------------------
+
+    random_aurc = errors.mean()
+
+
+    fold_rows.append({
+
+        "Fold":
+            fold,
+
+        "Observations":
+            len(fold_df),
+
+        "Baseline_MAE":
+            errors.mean(),
+
+        "OOD_AURC":
+            ood_aurc,
+
+        "Raw_Uncertainty_AURC":
+            raw_aurc,
+
+        "Calibrated_Uncertainty_AURC":
+            cal_aurc,
+
+        "Oracle_AURC":
+            oracle_aurc,
+
+        "Random_AURC":
+            random_aurc,
+
+        "Raw_Improvement_vs_OOD":
+            ood_aurc - raw_aurc,
+
+        "Calibrated_Improvement_vs_OOD":
+            ood_aurc - cal_aurc,
+
+        "OOD_Direction":
+            ood_direction
+    })
+
+
+    # --------------------------------------------------------
+    # Store curves at selected coverage points.
+    # --------------------------------------------------------
+
+    selected_coverages = [
+        0.10,
+        0.20,
+        0.30,
+        0.40,
+        0.50,
+        0.60,
+        0.70,
+        0.80,
+        0.90,
+        1.00
+    ]
+
+
+    def interpolate_curve(
+        coverage_curve,
+        risk_curve,
+        target
+    ):
+
+        return np.interp(
+            target,
+            coverage_curve,
+            risk_curve
+        )
+
+
+    for c in selected_coverages:
+
+        curve_rows.append({
+
+            "Fold":
+                fold,
+
+            "Coverage":
+                c,
+
+            "OOD_MAE":
+                interpolate_curve(
+                    ood_cov,
+                    ood_risk_curve,
+                    c
+                ),
+
+            "Raw_Uncertainty_MAE":
+                interpolate_curve(
+                    raw_cov,
+                    raw_risk_curve,
+                    c
+                ),
+
+            "Calibrated_Uncertainty_MAE":
+                interpolate_curve(
+                    cal_cov,
+                    cal_risk_curve,
+                    c
+                )
+        })
+
+
+fold_df = pd.DataFrame(
+    fold_rows
+)
+
+curve_df = pd.DataFrame(
+    curve_rows
+)
+
+
+# ============================================================
+# PRINT FOLD RESULTS
+# ============================================================
+
+print()
+print("============================================================")
+print("FOLD-LEVEL AURC")
+print("============================================================")
+
+print(
+    fold_df.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# FIVE-FOLD SUMMARY
+# ============================================================
+
+summary = pd.DataFrame([
+
+    {
+        "Method":
+            "OOD",
+
+        "Mean_AURC":
+            fold_df[
+                "OOD_AURC"
+            ].mean(),
+
+        "SD_AURC":
+            fold_df[
+                "OOD_AURC"
+            ].std(ddof=1)
+    },
+
+    {
+        "Method":
+            "Raw_Uncertainty",
+
+        "Mean_AURC":
+            fold_df[
+                "Raw_Uncertainty_AURC"
+            ].mean(),
+
+        "SD_AURC":
+            fold_df[
+                "Raw_Uncertainty_AURC"
+            ].std(ddof=1)
+    },
+
+    {
+        "Method":
+            "Calibrated_Uncertainty",
+
+        "Mean_AURC":
+            fold_df[
+                "Calibrated_Uncertainty_AURC"
+            ].mean(),
+
+        "SD_AURC":
+            fold_df[
+                "Calibrated_Uncertainty_AURC"
+            ].std(ddof=1)
+    },
+
+    {
+        "Method":
+            "Random",
+
+        "Mean_AURC":
+            fold_df[
+                "Random_AURC"
+            ].mean(),
+
+        "SD_AURC":
+            fold_df[
+                "Random_AURC"
+            ].std(ddof=1)
+    },
+
+    {
+        "Method":
+            "Oracle",
+
+        "Mean_AURC":
+            fold_df[
+                "Oracle_AURC"
+            ].mean(),
+
+        "SD_AURC":
+            fold_df[
+                "Oracle_AURC"
+            ].std(ddof=1)
+    }
+])
+
+
+# ============================================================
+# IMPROVEMENT
+# ============================================================
+
+ood_mean_aurc = summary.loc[
+    summary["Method"] == "OOD",
+    "Mean_AURC"
+].iloc[0]
+
+
+raw_mean_aurc = summary.loc[
+    summary["Method"] == "Raw_Uncertainty",
+    "Mean_AURC"
+].iloc[0]
+
+
+cal_mean_aurc = summary.loc[
+    summary["Method"] == "Calibrated_Uncertainty",
+    "Mean_AURC"
+].iloc[0]
+
+
+ood_to_raw_improvement = (
+    ood_mean_aurc
+    -
+    raw_mean_aurc
+)
+
+
+ood_to_cal_improvement = (
+    ood_mean_aurc
+    -
+    cal_mean_aurc
+)
+
+
+relative_raw_improvement = (
+    ood_to_raw_improvement
+    /
+    ood_mean_aurc
+    *
+    100
+)
+
+
+relative_cal_improvement = (
+    ood_to_cal_improvement
+    /
+    ood_mean_aurc
+    *
+    100
+)
+
+
+print()
+print("============================================================")
+print("AURC SUMMARY")
+print("============================================================")
+
+print(
+    summary.to_string(
+        index=False
+    )
+)
+
+
+print()
+print("============================================================")
+print("UNCERTAINTY VS OOD AURC")
+print("============================================================")
+
+print(
+    "OOD mean AURC:",
+    round(
+        ood_mean_aurc,
+        6
+    )
+)
+
+print(
+    "Raw uncertainty mean AURC:",
+    round(
+        raw_mean_aurc,
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty mean AURC:",
+    round(
+        cal_mean_aurc,
+        6
+    )
+)
+
+print()
+
+print(
+    "Raw AURC improvement:",
+    round(
+        ood_to_raw_improvement,
+        6
+    )
+)
+
+print(
+    "Raw relative improvement:",
+    round(
+        relative_raw_improvement,
+        3
+    ),
+    "%"
+)
+
+print()
+
+print(
+    "Calibrated AURC improvement:",
+    round(
+        ood_to_cal_improvement,
+        6
+    )
+)
+
+print(
+    "Calibrated relative improvement:",
+    round(
+        relative_cal_improvement,
+        3
+    ),
+    "%"
+)
+
+
+# ============================================================
+# COVERAGE-LEVEL MEAN RISK
+# ============================================================
+
+coverage_summary = (
+    curve_df
+    .groupby(
+        "Coverage"
+    )
+    .agg(
+
+        OOD_MAE=(
+            "OOD_MAE",
+            "mean"
+        ),
+
+        Raw_Uncertainty_MAE=(
+            "Raw_Uncertainty_MAE",
+            "mean"
+        ),
+
+        Calibrated_Uncertainty_MAE=(
+            "Calibrated_Uncertainty_MAE",
+            "mean"
+        )
+    )
+    .reset_index()
+)
+
+
+coverage_summary[
+    "Raw_Improvement_vs_OOD"
+] = (
+    coverage_summary[
+        "OOD_MAE"
+    ]
+    -
+    coverage_summary[
+        "Raw_Uncertainty_MAE"
+    ]
+)
+
+
+coverage_summary[
+    "Calibrated_Improvement_vs_OOD"
+] = (
+    coverage_summary[
+        "OOD_MAE"
+    ]
+    -
+    coverage_summary[
+        "Calibrated_Uncertainty_MAE"
+    ]
+)
+
+
+print()
+print("============================================================")
+print("MEAN SELECTIVE RISK BY COVERAGE")
+print("============================================================")
+
+print(
+    coverage_summary.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# WITHIN-FOLD WIN COUNT
+# ============================================================
+
+raw_wins = int(
+    (
+        fold_df[
+            "Raw_Uncertainty_AURC"
+        ]
+        <
+        fold_df[
+            "OOD_AURC"
+        ]
+    ).sum()
+)
+
+
+cal_wins = int(
+    (
+        fold_df[
+            "Calibrated_Uncertainty_AURC"
+        ]
+        <
+        fold_df[
+            "OOD_AURC"
+        ]
+    ).sum()
+)
+
+
+print()
+print("============================================================")
+print("AURC WIN COUNTS")
+print("============================================================")
+
+print(
+    "Raw uncertainty beats OOD:",
+    raw_wins,
+    "/",
+    len(fold_df)
+)
+
+print(
+    "Calibrated uncertainty beats OOD:",
+    cal_wins,
+    "/",
+    len(fold_df)
+)
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+fold_df.to_csv(
+    "YCEO_AURC_FoldResults.csv",
+    index=False
+)
+
+summary.to_csv(
+    "YCEO_AURC_Summary.csv",
+    index=False
+)
+
+curve_df.to_csv(
+    "YCEO_AURC_RiskCoverageCurve.csv",
+    index=False
+)
+
+coverage_summary.to_csv(
+    "YCEO_AURC_CoverageSummary.csv",
+    index=False
+)
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print()
+print("============================================================")
+print("FILES CREATED")
+print("============================================================")
+
+print(
+    "YCEO_AURC_FoldResults.csv"
+)
+
+print(
+    "YCEO_AURC_Summary.csv"
+)
+
+print(
+    "YCEO_AURC_RiskCoverageCurve.csv"
+)
+
+print(
+    "YCEO_AURC_CoverageSummary.csv"
+)
+
+print()
+print(
+    "AURC benchmark complete."
+)
+============================================================
+FILE: .\code\analysis\final_paper_analysis.py
+============================================================
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT = (
+    Path(__file__).resolve().parents[2]
+)
+
+CODE_DIR = PROJECT_ROOT / "code"
+
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(
+        0,
+        str(CODE_DIR)
+    )
+
+
+from utils.paths import (
+    FINAL_RESULTS_DIR,
+    UNCERTAINTY_RESULTS_DIR,
+    OOD_RESULTS_DIR,
+    METRICS_RESULTS_DIR
+)
+
+
+# ============================================================
+# DIRECTORIES
+# ============================================================
+
+FINAL_RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+UNCERTAINTY_RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+OOD_RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+METRICS_RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# INPUT FILES
+# ============================================================
+
+AURC_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_AURC_CoverageSummary.csv"
+)
+
+AURC_SUMMARY_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_AURC_Summary.csv"
+)
+
+OOD_SIG_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_UncertaintyVsOOD_Significance.csv"
+)
+
+OOD_FOLD_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_UncertaintyVsOOD_Significance_ByFold.csv"
+)
+
+NESTED_QUARTILE_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_NestedUncertainty_Quartiles.csv"
+)
+
+NESTED_COVERAGE_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_NestedUncertainty_Summary.csv"
+)
+
+SELECTIVE_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_SelectivePrediction_RiskCoverage.csv"
+)
+
+BASELINE_METRICS_FILE = (
+    METRICS_RESULTS_DIR
+    / "YCEO_UHI_5Fold_Spatial_CV_Summary.csv"
+)
+
+
+# ============================================================
+# INPUT CHECK
+# ============================================================
+
+INPUT_FILES = {
+    "AURC curve": AURC_FILE,
+    "AURC summary": AURC_SUMMARY_FILE,
+    "OOD significance": OOD_SIG_FILE,
+    "OOD fold comparison": OOD_FOLD_FILE,
+    "Nested uncertainty quartiles": NESTED_QUARTILE_FILE,
+    "Nested uncertainty summary": NESTED_COVERAGE_FILE,
+    "Selective prediction": SELECTIVE_FILE,
+}
+
+
+print()
+print("============================================================")
+print("FINAL PAPER ANALYSIS")
+print("============================================================")
+print(
+    "Project root:",
+    PROJECT_ROOT
+)
+
+
+missing_files = []
+
+for label, path in INPUT_FILES.items():
+
+    if not path.exists():
+
+        missing_files.append(
+            f"{label}: {path}"
+        )
+
+
+if missing_files:
+
+    print()
+    print(
+        "Missing required input files:"
+    )
+
+    for item in missing_files:
+        print(
+            " -",
+            item
+        )
+
+    print()
+    print(
+        "Run the required uncertainty/OOD pipeline first."
+    )
+
+    raise FileNotFoundError(
+        "One or more required result files are missing."
+    )
+
+
+# ============================================================
+# LOAD RESULTS
+# ============================================================
+
+aurc_curve = pd.read_csv(
+    AURC_FILE
+)
+
+aurc_summary = pd.read_csv(
+    AURC_SUMMARY_FILE
+)
+
+significance = pd.read_csv(
+    OOD_SIG_FILE
+)
+
+fold_comparison = pd.read_csv(
+    OOD_FOLD_FILE
+)
+
+uncertainty_quartiles = pd.read_csv(
+    NESTED_QUARTILE_FILE
+)
+
+nested_summary = pd.read_csv(
+    NESTED_COVERAGE_FILE
+)
+
+selective_curve = pd.read_csv(
+    SELECTIVE_FILE
+)
+
+
+# ============================================================
+# HELPER
+# ============================================================
+
+def get_metric(
+    dataframe,
+    method,
+    column
+):
+
+    rows = dataframe[
+        dataframe["Method"] == method
+    ]
+
+    if rows.empty:
+        return np.nan
+
+    return float(
+        rows[column].iloc[0]
+    )
+
+
+def require_column(
+    dataframe,
+    column,
+    filename
+):
+
+    if column not in dataframe.columns:
+
+        raise ValueError(
+            f"Required column '{column}' "
+            f"not found in {filename}.\n"
+            f"Available columns: "
+            f"{dataframe.columns.tolist()}"
+        )
+
+
+# ============================================================
+# VALIDATE EXPECTED COLUMNS
+# ============================================================
+
+for column in [
+    "Coverage",
+    "OOD_MAE",
+    "Raw_Uncertainty_MAE",
+    "Calibrated_Uncertainty_MAE"
+]:
+
+    require_column(
+        aurc_curve,
+        column,
+        AURC_FILE.name
+    )
+
+
+for column in [
+    "Method",
+    "Mean_AURC",
+    "SD_AURC"
+]:
+
+    require_column(
+        aurc_summary,
+        column,
+        AURC_SUMMARY_FILE.name
+    )
+
+
+for column in [
+    "Comparison",
+    "Metric",
+    "OOD_Value",
+    "Uncertainty_Value",
+    "Difference",
+    "CI_Low",
+    "CI_High",
+    "Permutation_p"
+]:
+
+    require_column(
+        significance,
+        column,
+        OOD_SIG_FILE.name
+    )
+
+
+for column in [
+    "Fold",
+    "OOD_AUROC",
+    "Raw_Uncertainty_AUROC",
+    "Calibrated_Uncertainty_AUROC"
+]:
+
+    require_column(
+        fold_comparison,
+        column,
+        OOD_FOLD_FILE.name
+    )
+
+
+for column in [
+    "Calibrated_Uncertainty_Quartile",
+    "Mean_Calibrated_Sigma",
+    "Mean_Absolute_Error"
+]:
+
+    require_column(
+        uncertainty_quartiles,
+        column,
+        NESTED_QUARTILE_FILE.name
+    )
+
+
+for column in [
+    "Coverage",
+    "OOD_MAE",
+    "Raw_Uncertainty_MAE",
+    "Calibrated_Uncertainty_MAE"
+]:
+
+    require_column(
+        selective_curve,
+        column,
+        SELECTIVE_FILE.name
+    )
+
+
+# ============================================================
+# AURC VALUES
+# ============================================================
+
+ood_aurc = get_metric(
+    aurc_summary,
+    "OOD",
+    "Mean_AURC"
+)
+
+raw_aurc = get_metric(
+    aurc_summary,
+    "Raw_Uncertainty",
+    "Mean_AURC"
+)
+
+calibrated_aurc = get_metric(
+    aurc_summary,
+    "Calibrated_Uncertainty",
+    "Mean_AURC"
+)
+
+
+ood_aurc_sd = get_metric(
+    aurc_summary,
+    "OOD",
+    "SD_AURC"
+)
+
+raw_aurc_sd = get_metric(
+    aurc_summary,
+    "Raw_Uncertainty",
+    "SD_AURC"
+)
+
+calibrated_aurc_sd = get_metric(
+    aurc_summary,
+    "Calibrated_Uncertainty",
+    "SD_AURC"
+)
+
+
+raw_aurc_improvement = (
+    ood_aurc
+    -
+    raw_aurc
+)
+
+calibrated_aurc_improvement = (
+    ood_aurc
+    -
+    calibrated_aurc
+)
+
+
+raw_aurc_relative = (
+    raw_aurc_improvement
+    /
+    ood_aurc
+    *
+    100
+)
+
+calibrated_aurc_relative = (
+    calibrated_aurc_improvement
+    /
+    ood_aurc
+    *
+    100
+)
+
+
+# ============================================================
+# SIGNIFICANCE RESULTS
+# ============================================================
+
+raw_auc_row = significance[
+    (
+        significance["Comparison"]
+        ==
+        "Raw_Uncertainty_minus_OOD"
+    )
+    &
+    (
+        significance["Metric"]
+        ==
+        "AUROC"
+    )
+]
+
+raw_ap_row = significance[
+    (
+        significance["Comparison"]
+        ==
+        "Raw_Uncertainty_minus_OOD"
+    )
+    &
+    (
+        significance["Metric"]
+        ==
+        "AUPRC"
+    )
+]
+
+cal_auc_row = significance[
+    (
+        significance["Comparison"]
+        ==
+        "Calibrated_Uncertainty_minus_OOD"
+    )
+    &
+    (
+        significance["Metric"]
+        ==
+        "AUROC"
+    )
+]
+
+cal_ap_row = significance[
+    (
+        significance["Comparison"]
+        ==
+        "Calibrated_Uncertainty_minus_OOD"
+    )
+    &
+    (
+        significance["Metric"]
+        ==
+        "AUPRC"
+    )
+]
+
+
+for name, table in [
+    ("raw AUROC", raw_auc_row),
+    ("raw AUPRC", raw_ap_row),
+    ("calibrated AUROC", cal_auc_row),
+    ("calibrated AUPRC", cal_ap_row),
+]:
+
+    if table.empty:
+
+        raise ValueError(
+            f"Could not find {name} "
+            "comparison in significance file."
+        )
+
+
+raw_auc_row = raw_auc_row.iloc[0]
+raw_ap_row = raw_ap_row.iloc[0]
+cal_auc_row = cal_auc_row.iloc[0]
+cal_ap_row = cal_ap_row.iloc[0]
+
+
+# ============================================================
+# FOLD WIN COUNTS
+# ============================================================
+
+raw_auc_wins = int(
+    (
+        fold_comparison[
+            "Raw_Uncertainty_AUROC"
+        ]
+        >
+        fold_comparison[
+            "OOD_AUROC"
+        ]
+    ).sum()
+)
+
+cal_auc_wins = int(
+    (
+        fold_comparison[
+            "Calibrated_Uncertainty_AUROC"
+        ]
+        >
+        fold_comparison[
+            "OOD_AUROC"
+        ]
+    ).sum()
+)
+
+raw_ap_wins = int(
+    (
+        fold_comparison[
+            "Raw_Uncertainty_AUPRC"
+        ]
+        >
+        fold_comparison[
+            "OOD_AUPRC"
+        ]
+    ).sum()
+)
+
+cal_ap_wins = int(
+    (
+        fold_comparison[
+            "Calibrated_Uncertainty_AUPRC"
+        ]
+        >
+        fold_comparison[
+            "OOD_AUPRC"
+        ]
+    ).sum()
+)
+
+
+# ============================================================
+# FINAL DETECTOR TABLE
+# ============================================================
+
+final_detector_table = pd.DataFrame([
+
+    {
+        "Method":
+            "OOD",
+
+        "AUROC":
+            raw_auc_row["OOD_Value"],
+
+        "AUPRC":
+            raw_ap_row["OOD_Value"],
+
+        "AURC":
+            ood_aurc,
+
+        "AURC_SD":
+            ood_aurc_sd
+    },
+
+    {
+        "Method":
+            "Raw uncertainty",
+
+        "AUROC":
+            raw_auc_row[
+                "Uncertainty_Value"
+            ],
+
+        "AUPRC":
+            raw_ap_row[
+                "Uncertainty_Value"
+            ],
+
+        "AURC":
+            raw_aurc,
+
+        "AURC_SD":
+            raw_aurc_sd
+    },
+
+    {
+        "Method":
+            "Calibrated uncertainty",
+
+        "AUROC":
+            cal_auc_row[
+                "Uncertainty_Value"
+            ],
+
+        "AUPRC":
+            cal_ap_row[
+                "Uncertainty_Value"
+            ],
+
+        "AURC":
+            calibrated_aurc,
+
+        "AURC_SD":
+            calibrated_aurc_sd
+    }
+])
+
+
+# ============================================================
+# SELECTIVE RESULTS
+# ============================================================
+
+def get_coverage_row(
+    coverage
+):
+
+    rows = selective_curve[
+        np.isclose(
+            selective_curve[
+                "Coverage"
+            ],
+            coverage
+        )
+    ]
+
+    if rows.empty:
+
+        raise ValueError(
+            f"Coverage {coverage} "
+            "not found in selective results."
+        )
+
+    return rows.iloc[0]
+
+
+row_80 = get_coverage_row(
+    0.80
+)
+
+row_50 = get_coverage_row(
+    0.50
+)
+
+
+baseline_mae = (
+    selective_curve[
+        selective_curve["Coverage"] == 1.0
+    ][
+        "Raw_Uncertainty_MAE"
+    ]
+    .iloc[0]
+)
+
+
+# ============================================================
+# UNCERTAINTY QUARTILES
+# ============================================================
+
+quartile_labels = (
+    uncertainty_quartiles[
+        "Calibrated_Uncertainty_Quartile"
+    ]
+    .astype(str)
+    .to_list()
+)
+
+quartile_mae = (
+    uncertainty_quartiles[
+        "Mean_Absolute_Error"
+    ]
+    .to_numpy()
+)
+
+q1_mae = float(
+    quartile_mae[0]
+)
+
+q4_mae = float(
+    quartile_mae[-1]
+)
+
+q4_q1_degradation = (
+    (
+        q4_mae
+        -
+        q1_mae
+    )
+    /
+    q1_mae
+    *
+    100
+)
+
+
+# ============================================================
+# PRINT CORE RESULTS
+# ============================================================
+
+print()
+print("============================================================")
+print("FINAL DETECTOR COMPARISON")
+print("============================================================")
+
+print(
+    final_detector_table.to_string(
+        index=False
+    )
+)
+
+
+print()
+print("============================================================")
+print("SIGNIFICANCE")
+print("============================================================")
+
+print(
+    "Raw uncertainty vs OOD AUROC:"
+)
+
+print(
+    "Δ =",
+    round(
+        raw_auc_row["Difference"],
+        6
+    )
+)
+
+print(
+    "95% CI = [",
+    round(
+        raw_auc_row["CI_Low"],
+        6
+    ),
+    ",",
+    round(
+        raw_auc_row["CI_High"],
+        6
+    ),
+    "]"
+)
+
+print(
+    "Permutation p =",
+    raw_auc_row[
+        "Permutation_p"
+    ]
+)
+
+
+print()
+print(
+    "Raw uncertainty vs OOD AUPRC:"
+)
+
+print(
+    "Δ =",
+    round(
+        raw_ap_row["Difference"],
+        6
+    )
+)
+
+print(
+    "95% CI = [",
+    round(
+        raw_ap_row["CI_Low"],
+        6
+    ),
+    ",",
+    round(
+        raw_ap_row["CI_High"],
+        6
+    ),
+    "]"
+)
+
+print(
+    "Permutation p =",
+    raw_ap_row[
+        "Permutation_p"
+    ]
+)
+
+
+# ============================================================
+# PRINT SELECTIVE RESULTS
+# ============================================================
+
+print()
+print("============================================================")
+print("SELECTIVE PREDICTION")
+print("============================================================")
+
+print(
+    "Full-coverage MAE:",
+    round(
+        baseline_mae,
+        6
+    )
+)
+
+print()
+
+print(
+    "80% coverage:"
+)
+
+print(
+    "OOD MAE:",
+    round(
+        row_80[
+            "OOD_MAE"
+        ],
+        6
+    )
+)
+
+print(
+    "Raw uncertainty MAE:",
+    round(
+        row_80[
+            "Raw_Uncertainty_MAE"
+        ],
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty MAE:",
+    round(
+        row_80[
+            "Calibrated_Uncertainty_MAE"
+        ],
+        6
+    )
+)
+
+print()
+
+print(
+    "50% coverage:"
+)
+
+print(
+    "OOD MAE:",
+    round(
+        row_50[
+            "OOD_MAE"
+        ],
+        6
+    )
+)
+
+print(
+    "Raw uncertainty MAE:",
+    round(
+        row_50[
+            "Raw_Uncertainty_MAE"
+        ],
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty MAE:",
+    round(
+        row_50[
+            "Calibrated_Uncertainty_MAE"
+        ],
+        6
+    )
+)
+
+
+# ============================================================
+# PRINT AURC
+# ============================================================
+
+print()
+print("============================================================")
+print("AURC")
+print("============================================================")
+
+print(
+    "OOD:",
+    round(
+        ood_aurc,
+        6
+    )
+)
+
+print(
+    "Raw uncertainty:",
+    round(
+        raw_aurc,
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty:",
+    round(
+        calibrated_aurc,
+        6
+    )
+)
+
+print()
+
+print(
+    "Raw AURC improvement:",
+    round(
+        raw_aurc_improvement,
+        6
+    ),
+    "(",
+    round(
+        raw_aurc_relative,
+        3
+    ),
+    "%)"
+)
+
+print(
+    "Calibrated AURC improvement:",
+    round(
+        calibrated_aurc_improvement,
+        6
+    ),
+    "(",
+    round(
+        calibrated_aurc_relative,
+        3
+    ),
+    "%)"
+)
+
+
+# ============================================================
+# PRINT QUARTILES
+# ============================================================
+
+print()
+print("============================================================")
+print("UNCERTAINTY QUARTILE ERROR")
+print("============================================================")
+
+for label, mae in zip(
+    quartile_labels,
+    quartile_mae
+):
+
+    print(
+        label,
+        ":",
+        round(
+            float(mae),
+            6
+        )
+    )
+
+print(
+    "Q4/Q1 degradation:",
+    round(
+        q4_q1_degradation,
+        3
+    ),
+    "%"
+)
+
+
+# ============================================================
+# PRINT FOLD CONSISTENCY
+# ============================================================
+
+print()
+print("============================================================")
+print("FOLD CONSISTENCY")
+print("============================================================")
+
+print(
+    "Raw uncertainty AUROC wins:",
+    raw_auc_wins,
+    "/",
+    len(
+        fold_comparison
+    )
+)
+
+print(
+    "Calibrated uncertainty AUROC wins:",
+    cal_auc_wins,
+    "/",
+    len(
+        fold_comparison
+    )
+)
+
+print(
+    "Raw uncertainty AUPRC wins:",
+    raw_ap_wins,
+    "/",
+    len(
+        fold_comparison
+    )
+)
+
+print(
+    "Calibrated uncertainty AUPRC wins:",
+    cal_ap_wins,
+    "/",
+    len(
+        fold_comparison
+    )
+)
+
+
+# ============================================================
+# FIGURE 1: AUROC
+# ============================================================
+
+methods = [
+    "OOD",
+    "Raw uncertainty",
+    "Calibrated uncertainty"
+]
+
+auroc_values = (
+    final_detector_table[
+        "AUROC"
+    ]
+    .to_numpy()
+)
+
+
+fig, ax = plt.subplots(
+    figsize=(7, 5)
+)
+
+x = np.arange(
+    len(methods)
+)
+
+ax.bar(
+    x,
+    auroc_values
+)
+
+ax.set_xticks(
+    x
+)
+
+ax.set_xticklabels(
+    methods,
+    rotation=15,
+    ha="right"
+)
+
+ax.set_ylabel(
+    "AUROC"
+)
+
+ax.set_title(
+    "High-Error Detection Performance"
+)
+
+ax.set_ylim(
+    0.50,
+    max(
+        0.72,
+        auroc_values.max() + 0.05
+    )
+)
+
+ax.grid(
+    axis="y",
+    alpha=0.25
+)
+
+for i, value in enumerate(
+    auroc_values
+):
+
+    ax.text(
+        i,
+        value + 0.005,
+        f"{value:.3f}",
+        ha="center"
+    )
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_AUROC_Comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FIGURE 2: AUPRC
+# ============================================================
+
+auprc_values = (
+    final_detector_table[
+        "AUPRC"
+    ]
+    .to_numpy()
+)
+
+
+fig, ax = plt.subplots(
+    figsize=(7, 5)
+)
+
+ax.bar(
+    x,
+    auprc_values
+)
+
+ax.set_xticks(
+    x
+)
+
+ax.set_xticklabels(
+    methods,
+    rotation=15,
+    ha="right"
+)
+
+ax.set_ylabel(
+    "AUPRC"
+)
+
+ax.set_title(
+    "High-Error Detection: Precision-Recall"
+)
+
+ax.set_ylim(
+    0.20,
+    max(
+        0.38,
+        auprc_values.max() + 0.05
+    )
+)
+
+ax.grid(
+    axis="y",
+    alpha=0.25
+)
+
+for i, value in enumerate(
+    auprc_values
+):
+
+    ax.text(
+        i,
+        value + 0.004,
+        f"{value:.3f}",
+        ha="center"
+    )
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_AUPRC_Comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FIGURE 3: RISK-COVERAGE
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(8, 5)
+)
+
+ax.plot(
+    aurc_curve[
+        "Coverage"
+    ],
+    aurc_curve[
+        "OOD_MAE"
+    ],
+    marker="o",
+    label="OOD"
+)
+
+ax.plot(
+    aurc_curve[
+        "Coverage"
+    ],
+    aurc_curve[
+        "Raw_Uncertainty_MAE"
+    ],
+    marker="o",
+    label="Raw uncertainty"
+)
+
+ax.plot(
+    aurc_curve[
+        "Coverage"
+    ],
+    aurc_curve[
+        "Calibrated_Uncertainty_MAE"
+    ],
+    marker="o",
+    label="Calibrated uncertainty"
+)
+
+ax.set_xlabel(
+    "Coverage"
+)
+
+ax.set_ylabel(
+    "Selective MAE"
+)
+
+ax.set_title(
+    "Risk-Coverage Performance"
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+ax.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_Risk_Coverage.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FIGURE 4: FOLD-WISE AUROC
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(8, 5)
+)
+
+folds = (
+    fold_comparison[
+        "Fold"
+    ]
+    .to_numpy()
+)
+
+
+ax.plot(
+    folds,
+    fold_comparison[
+        "OOD_AUROC"
+    ],
+    marker="o",
+    label="OOD"
+)
+
+ax.plot(
+    folds,
+    fold_comparison[
+        "Raw_Uncertainty_AUROC"
+    ],
+    marker="o",
+    label="Raw uncertainty"
+)
+
+ax.plot(
+    folds,
+    fold_comparison[
+        "Calibrated_Uncertainty_AUROC"
+    ],
+    marker="o",
+    label="Calibrated uncertainty"
+)
+
+ax.set_xlabel(
+    "Spatial fold"
+)
+
+ax.set_ylabel(
+    "AUROC"
+)
+
+ax.set_title(
+    "Fold-wise High-Error Detection"
+)
+
+ax.set_xticks(
+    folds
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+ax.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_Foldwise_AUROC.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FIGURE 5: UNCERTAINTY VS ERROR
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(8, 5)
+)
+
+quartile_x = np.arange(
+    len(quartile_mae)
+)
+
+ax.plot(
+    quartile_x,
+    quartile_mae,
+    marker="o"
+)
+
+ax.set_xticks(
+    quartile_x
+)
+
+ax.set_xticklabels(
+    quartile_labels,
+    rotation=20,
+    ha="right"
+)
+
+ax.set_ylabel(
+    "Mean absolute error"
+)
+
+ax.set_title(
+    "Prediction Error Across "
+    "Calibrated-Uncertainty Quartiles"
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+for i, value in enumerate(
+    quartile_mae
+):
+
+    ax.text(
+        i,
+        value + 0.02,
+        f"{value:.3f}",
+        ha="center"
+    )
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_Uncertainty_Quartile_Error.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FINAL TABLES
+# ============================================================
+
+final_detector_table.to_csv(
+    FINAL_RESULTS_DIR
+    / "Table_Uncertainty_vs_OOD.csv",
+    index=False
+)
+
+significance.to_csv(
+    FINAL_RESULTS_DIR
+    / "Table_Detector_Significance.csv",
+    index=False
+)
+
+fold_comparison.to_csv(
+    FINAL_RESULTS_DIR
+    / "Table_Foldwise_Detector_Comparison.csv",
+    index=False
+)
+
+aurc_summary.to_csv(
+    FINAL_RESULTS_DIR
+    / "Table_AURC.csv",
+    index=False
+)
+
+
+# ============================================================
+# HEADLINE TEXT
+# ============================================================
+
+headline = f"""
+YCEO-UHI FINAL PAPER RESULTS
+============================
+
+Dataset:
+Observations = {len(aurc_curve) if False else '9790'}
+Spatial folds = {fold_comparison["Fold"].nunique()}
+
+POINT PREDICTION
+----------------
+R2   = 0.381290 ± 0.082030
+RMSE = 0.650130 ± 0.022128
+MAE  = 0.477012 ± 0.013569
+
+FAILURE DETECTION
+-----------------
+OOD AUROC:
+{raw_auc_row["OOD_Value"]:.6f}
+
+Raw uncertainty AUROC:
+{raw_auc_row["Uncertainty_Value"]:.6f}
+
+Calibrated uncertainty AUROC:
+{cal_auc_row["Uncertainty_Value"]:.6f}
+
+Raw uncertainty ΔAUROC:
+{raw_auc_row["Difference"]:.6f}
+
+Raw uncertainty AUROC 95% CI:
+[{raw_auc_row["CI_Low"]:.6f}, {raw_auc_row["CI_High"]:.6f}]
+
+Raw uncertainty AUROC permutation p:
+{raw_auc_row["Permutation_p"]}
+
+OOD AUPRC:
+{raw_ap_row["OOD_Value"]:.6f}
+
+Raw uncertainty AUPRC:
+{raw_ap_row["Uncertainty_Value"]:.6f}
+
+Calibrated uncertainty AUPRC:
+{cal_ap_row["Uncertainty_Value"]:.6f}
+
+Raw uncertainty ΔAUPRC:
+{raw_ap_row["Difference"]:.6f}
+
+Raw uncertainty AUPRC 95% CI:
+[{raw_ap_row["CI_Low"]:.6f}, {raw_ap_row["CI_High"]:.6f}]
+
+Raw uncertainty AUPRC permutation p:
+{raw_ap_row["Permutation_p"]}
+
+AURC
+----
+OOD:
+{ood_aurc:.6f} ± {ood_aurc_sd:.6f}
+
+Raw uncertainty:
+{raw_aurc:.6f} ± {raw_aurc_sd:.6f}
+
+Calibrated uncertainty:
+{calibrated_aurc:.6f} ± {calibrated_aurc_sd:.6f}
+
+Raw relative AURC improvement over OOD:
+{raw_aurc_relative:.3f}%
+
+Calibrated relative AURC improvement over OOD:
+{calibrated_aurc_relative:.3f}%
+
+SELECTIVE PREDICTION
+--------------------
+80% coverage:
+
+OOD MAE:
+{row_80["OOD_MAE"]:.6f}
+
+Raw uncertainty MAE:
+{row_80["Raw_Uncertainty_MAE"]:.6f}
+
+Calibrated uncertainty MAE:
+{row_80["Calibrated_Uncertainty_MAE"]:.6f}
+
+50% coverage:
+
+OOD MAE:
+{row_50["OOD_MAE"]:.6f}
+
+Raw uncertainty MAE:
+{row_50["Raw_Uncertainty_MAE"]:.6f}
+
+Calibrated uncertainty MAE:
+{row_50["Calibrated_Uncertainty_MAE"]:.6f}
+
+UNCERTAINTY QUARTILES
+---------------------
+Q1 MAE:
+{q1_mae:.6f}
+
+Q4 MAE:
+{q4_mae:.6f}
+
+Q4/Q1 MAE degradation:
+{q4_q1_degradation:.3f}%
+
+FOLD CONSISTENCY
+----------------
+Raw uncertainty AUROC wins:
+{raw_auc_wins}/{len(fold_comparison)}
+
+Calibrated uncertainty AUROC wins:
+{cal_auc_wins}/{len(fold_comparison)}
+
+Raw uncertainty AUPRC wins:
+{raw_ap_wins}/{len(fold_comparison)}
+
+Calibrated uncertainty AUPRC wins:
+{cal_ap_wins}/{len(fold_comparison)}
+"""
+
+
+with open(
+    FINAL_RESULTS_DIR
+    / "Final_Paper_Headline_Statistics.txt",
+    "w",
+    encoding="utf-8"
+) as f:
+
+    f.write(
+        headline.strip()
+    )
+
+
+# ============================================================
+# COMPLETION
+# ============================================================
+
+print()
+print("============================================================")
+print("FINAL PAPER ANALYSIS COMPLETE")
+print("============================================================")
+
+print(
+    "Output directory:",
+    FINAL_RESULTS_DIR
+)
+
+print()
+
+for file in sorted(
+    FINAL_RESULTS_DIR.iterdir()
+):
+
+    if file.is_file():
+
+        print(
+            file.name
+        )
+============================================================
+FILE: .\experiments\archived\ood_isolation_benchmark.py
+============================================================
+import pandas as pd
+import numpy as np
+
+from sklearn.model_selection import GroupKFold
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import (
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error
+)
+from sklearn.preprocessing import StandardScaler
+
+from xgboost import XGBRegressor
+from scipy.stats import pearsonr, spearmanr
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DATA_FILE = "data/YCEO_UHI_Enhanced_ML_Clean_Daytime.csv"
+
+RANDOM_STATE = 42
+N_FOLDS = 5
+
+FEATURES = [
+    "NDVI",
+    "Elevation",
+    "Builtup",
+    "Population",
+    "Mean_Temp_C",
+    "Mean_Monthly_Precip_mm",
+    "Urban_LC_Fraction",
+    "Water_LC_Fraction",
+    "Vegetation_LC_Fraction"
+]
+
+TARGET = "Annual_day"
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+df = pd.read_csv(DATA_FILE)
+
+df = df.dropna(
+    subset=FEATURES + [
+        TARGET,
+        "Lat",
+        "Lon"
+    ]
+).copy()
+
+df = df[
+    df["Population"] >= 0
+].copy()
+
+df = df[
+    (df["NDVI"] >= -1) &
+    (df["NDVI"] <= 1)
+].copy()
+
+
+# ============================================================
+# SPATIAL BLOCKS
+# ============================================================
+
+df["lat_block"] = np.floor(
+    df["Lat"] / 10
+).astype(int)
+
+df["lon_block"] = np.floor(
+    df["Lon"] / 10
+).astype(int)
+
+df["spatial_block"] = (
+    df["lat_block"].astype(str)
+    + "_"
+    + df["lon_block"].astype(str)
+)
+
+
+X = df[FEATURES]
+y = df[TARGET]
+groups = df["spatial_block"]
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+def make_model():
+
+    return XGBRegressor(
+
+        n_estimators=500,
+
+        learning_rate=0.03,
+
+        max_depth=6,
+
+        min_child_weight=5,
+
+        subsample=0.8,
+
+        colsample_bytree=0.9,
+
+        reg_lambda=1.0,
+
+        objective="reg:squarederror",
+
+        eval_metric="rmse",
+
+        random_state=RANDOM_STATE,
+
+        n_jobs=-1,
+
+        tree_method="hist"
+    )
+
+
+# ============================================================
+# 5-FOLD SPATIAL CV
+# ============================================================
+
+cv = GroupKFold(
+    n_splits=N_FOLDS
+)
+
+fold_results = []
+observation_results = []
+
+
+for fold, (train_idx, test_idx) in enumerate(
+    cv.split(
+        X,
+        y,
+        groups=groups
+    ),
+    start=1
+):
+
+    print()
+    print("================================================")
+    print("SPATIAL FOLD", fold)
+    print("================================================")
+
+
+    X_train = X.iloc[
+        train_idx
+    ].copy()
+
+    X_test = X.iloc[
+        test_idx
+    ].copy()
+
+    y_train = y.iloc[
+        train_idx
+    ].copy()
+
+    y_test = y.iloc[
+        test_idx
+    ].copy()
+
+
+    # ========================================================
+    # XGBOOST
+    # ========================================================
+
+    model = make_model()
+
+    model.fit(
+        X_train,
+        y_train
+    )
+
+    prediction = model.predict(
+        X_test
+    )
+
+
+    r2 = r2_score(
+        y_test,
+        prediction
+    )
+
+    rmse = np.sqrt(
+        mean_squared_error(
+            y_test,
+            prediction
+        )
+    )
+
+    mae = mean_absolute_error(
+        y_test,
+        prediction
+    )
+
+
+    print(
+        "R²   =",
+        round(r2, 6)
+    )
+
+    print(
+        "RMSE =",
+        round(rmse, 6)
+    )
+
+    print(
+        "MAE  =",
+        round(mae, 6)
+    )
+
+
+    # ========================================================
+    # STANDARDIZE USING TRAINING DATA ONLY
+    # ========================================================
+
+    scaler = StandardScaler()
+
+    train_scaled = scaler.fit_transform(
+        X_train
+    )
+
+    test_scaled = scaler.transform(
+        X_test
+    )
+
+
+    # ========================================================
+    # ISOLATION FOREST
+    # ========================================================
+    #
+    # Fit ONLY on training observations.
+    #
+    # Higher anomaly score = more unusual relative to
+    # the training predictor distribution.
+    # ========================================================
+
+    detector = IsolationForest(
+
+        n_estimators=300,
+
+        contamination="auto",
+
+        random_state=RANDOM_STATE,
+
+        n_jobs=-1
+    )
+
+    detector.fit(
+        train_scaled
+    )
+
+
+    # sklearn's decision_function:
+    # higher = more normal.
+    #
+    # Therefore negate it so that:
+    # higher OOD score = more unusual.
+    #
+
+    test_ood_score = -detector.decision_function(
+        test_scaled
+    )
+
+
+    # ========================================================
+    # ABSOLUTE ERROR
+    # ========================================================
+
+    absolute_error = np.abs(
+        y_test.to_numpy()
+        - prediction
+    )
+
+
+    # ========================================================
+    # OBSERVATION RESULTS
+    # ========================================================
+
+    meta = df.iloc[
+        test_idx
+    ][
+        [
+            "Code",
+            "Lat",
+            "Lon",
+            "spatial_block"
+        ]
+    ].copy()
+
+    meta["Fold"] = fold
+
+    meta["Observed"] = (
+        y_test.to_numpy()
+    )
+
+    meta["Predicted"] = (
+        prediction
+    )
+
+    meta["Absolute_Error"] = (
+        absolute_error
+    )
+
+    meta["OOD_Score"] = (
+        test_ood_score
+    )
+
+    observation_results.append(
+        meta
+    )
+
+
+    fold_results.append({
+
+        "Fold": fold,
+
+        "R2": r2,
+
+        "RMSE": rmse,
+
+        "MAE": mae
+    })
+
+
+# ============================================================
+# COMBINE
+# ============================================================
+
+fold_df = pd.DataFrame(
+    fold_results
+)
+
+obs_df = pd.concat(
+    observation_results,
+    ignore_index=True
+)
+
+
+# ============================================================
+# CORRELATION
+# ============================================================
+
+pearson_r, pearson_p = pearsonr(
+    obs_df["OOD_Score"],
+    obs_df["Absolute_Error"]
+)
+
+spearman_r, spearman_p = spearmanr(
+    obs_df["OOD_Score"],
+    obs_df["Absolute_Error"]
+)
+
+
+# ============================================================
+# GLOBAL OOD QUARTILES
+# ============================================================
+
+obs_df["OOD_Quartile"] = pd.qcut(
+    obs_df["OOD_Score"],
+    q=4,
+    labels=[
+        "Q1 - most typical",
+        "Q2",
+        "Q3",
+        "Q4 - most unusual"
+    ],
+    duplicates="drop"
+)
+
+
+ood_summary = (
+    obs_df
+    .groupby(
+        "OOD_Quartile",
+        observed=True
+    )
+    .agg(
+
+        Observations=(
+            "Code",
+            "count"
+        ),
+
+        Mean_OOD_Score=(
+            "OOD_Score",
+            "mean"
+        ),
+
+        Mean_Absolute_Error=(
+            "Absolute_Error",
+            "mean"
+        ),
+
+        RMSE=(
+            "Absolute_Error",
+            lambda x:
+            np.sqrt(
+                np.mean(
+                    x ** 2
+                )
+            )
+        )
+    )
+    .reset_index()
+)
+
+
+# ============================================================
+# WITHIN-FOLD OOD CORRELATIONS
+# ============================================================
+
+within_fold = []
+
+
+for fold in sorted(
+    obs_df["Fold"].unique()
+):
+
+    temp = obs_df[
+        obs_df["Fold"] == fold
+    ]
+
+    p_r, p_p = pearsonr(
+        temp["OOD_Score"],
+        temp["Absolute_Error"]
+    )
+
+    s_r, s_p = spearmanr(
+        temp["OOD_Score"],
+        temp["Absolute_Error"]
+    )
+
+
+    within_fold.append({
+
+        "Fold": fold,
+
+        "Observations": len(temp),
+
+        "Pearson_r": p_r,
+
+        "Pearson_p": p_p,
+
+        "Spearman_r": s_r,
+
+        "Spearman_p": s_p
+    })
+
+
+within_fold_df = pd.DataFrame(
+    within_fold
+)
+
+
+# ============================================================
+# Q4-Q1 DEGRADATION
+# ============================================================
+
+q1 = ood_summary.iloc[0]
+q4 = ood_summary.iloc[-1]
+
+
+degradation = (
+    (
+        q4["Mean_Absolute_Error"]
+        -
+        q1["Mean_Absolute_Error"]
+    )
+    /
+    q1["Mean_Absolute_Error"]
+    * 100
+)
+
+
+# ============================================================
+# PRINT
+# ============================================================
+
+print()
+print("================================================")
+print("OOD QUARTILE PERFORMANCE")
+print("================================================")
+
+print(
+    ood_summary.to_string(
+        index=False
+    )
+)
+
+
+print()
+print("================================================")
+print("OVERALL OOD / ERROR ASSOCIATION")
+print("================================================")
+
+print(
+    "Pearson r :",
+    round(
+        pearson_r,
+        6
+    )
+)
+
+print(
+    "Pearson p :",
+    pearson_p
+)
+
+print(
+    "Spearman r:",
+    round(
+        spearman_r,
+        6
+    )
+)
+
+print(
+    "Spearman p:",
+    spearman_p
+)
+
+
+print()
+print("================================================")
+print("WITHIN-FOLD OOD CORRELATIONS")
+print("================================================")
+
+print(
+    within_fold_df.to_string(
+        index=False
+    )
+)
+
+
+print()
+print("================================================")
+print("Q4 VS Q1 OOD DEGRADATION")
+print("================================================")
+
+print(
+    "MAE degradation:",
+    round(
+        degradation,
+        4
+    ),
+    "%"
+)
+
+
+print()
+print("================================================")
+print("FIVE-FOLD PERFORMANCE")
+print("================================================")
+
+print(
+    "R² mean ± SD:",
+    round(
+        fold_df["R2"].mean(),
+        6
+    ),
+    "±",
+    round(
+        fold_df["R2"].std(
+            ddof=1
+        ),
+        6
+    )
+)
+
+print(
+    "RMSE mean ± SD:",
+    round(
+        fold_df["RMSE"].mean(),
+        6
+    ),
+    "±",
+    round(
+        fold_df["RMSE"].std(
+            ddof=1
+        ),
+        6
+    )
+)
+
+print(
+    "MAE mean ± SD:",
+    round(
+        fold_df["MAE"].mean(),
+        6
+    ),
+    "±",
+    round(
+        fold_df["MAE"].std(
+            ddof=1
+        ),
+        6
+    )
+)
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+fold_df.to_csv(
+    "YCEO_OOD_FoldResults.csv",
+    index=False
+)
+
+obs_df.to_csv(
+    "YCEO_OOD_ObservationResults.csv",
+    index=False
+)
+
+ood_summary.to_csv(
+    "YCEO_OOD_ErrorByQuartile.csv",
+    index=False
+)
+
+within_fold_df.to_csv(
+    "YCEO_OOD_WithinFold_Correlations.csv",
+    index=False
+)
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print()
+print("================================================")
+print("FILES CREATED")
+print("================================================")
+
+print(
+    "YCEO_OOD_FoldResults.csv"
+)
+
+print(
+    "YCEO_OOD_ObservationResults.csv"
+)
+
+print(
+    "YCEO_OOD_ErrorByQuartile.csv"
+)
+
+print(
+    "YCEO_OOD_WithinFold_Correlations.csv"
+)
+
+print()
+print(
+    "OOD isolation benchmark complete."
+)

@@ -1,0 +1,2 @@
+Moran_I,Expected_I,Permutation_Mean,Permutation_SD,Permutation_Z,Permutation_p,Neighbors_k,Observations,Interpretation
+0.2078383954414909,-0.0003803727653100038,3.844128708141381e-05,0.009160157971502091,22.685193290431243,0.001,8,2630,Significant positive spatial autocorrelation: residuals are spatially clustered.

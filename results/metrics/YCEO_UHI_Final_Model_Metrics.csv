@@ -1,0 +1,2 @@
+Model,Validation,R2,RMSE,MAE,Train_samples,Test_samples,Spatial_blocks
+XGBoost,Spatial 10-degree blocks,0.382648063859904,0.6149841451453145,0.45095636404592027,7160,2630,182

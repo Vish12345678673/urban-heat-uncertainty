@@ -1,0 +1,1568 @@
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT = (
+    Path(__file__).resolve().parents[2]
+)
+
+CODE_DIR = PROJECT_ROOT / "code"
+
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(
+        0,
+        str(CODE_DIR)
+    )
+
+
+from utils.paths import (
+    FINAL_RESULTS_DIR,
+    UNCERTAINTY_RESULTS_DIR,
+    OOD_RESULTS_DIR,
+    METRICS_RESULTS_DIR
+)
+
+
+# ============================================================
+# DIRECTORIES
+# ============================================================
+
+FINAL_RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+UNCERTAINTY_RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+OOD_RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+METRICS_RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# INPUT FILES
+# ============================================================
+
+AURC_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_AURC_CoverageSummary.csv"
+)
+
+AURC_SUMMARY_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_AURC_Summary.csv"
+)
+
+OOD_SIG_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_UncertaintyVsOOD_Significance.csv"
+)
+
+OOD_FOLD_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_UncertaintyVsOOD_Significance_ByFold.csv"
+)
+
+NESTED_QUARTILE_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_NestedUncertainty_Quartiles.csv"
+)
+
+NESTED_COVERAGE_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_NestedUncertainty_Summary.csv"
+)
+
+SELECTIVE_FILE = (
+    UNCERTAINTY_RESULTS_DIR
+    / "YCEO_SelectivePrediction_RiskCoverage.csv"
+)
+
+BASELINE_METRICS_FILE = (
+    METRICS_RESULTS_DIR
+    / "YCEO_UHI_5Fold_Spatial_CV_Summary.csv"
+)
+
+
+# ============================================================
+# INPUT CHECK
+# ============================================================
+
+INPUT_FILES = {
+    "AURC curve": AURC_FILE,
+    "AURC summary": AURC_SUMMARY_FILE,
+    "OOD significance": OOD_SIG_FILE,
+    "OOD fold comparison": OOD_FOLD_FILE,
+    "Nested uncertainty quartiles": NESTED_QUARTILE_FILE,
+    "Nested uncertainty summary": NESTED_COVERAGE_FILE,
+    "Selective prediction": SELECTIVE_FILE,
+}
+
+
+print()
+print("============================================================")
+print("FINAL PAPER ANALYSIS")
+print("============================================================")
+print(
+    "Project root:",
+    PROJECT_ROOT
+)
+
+
+missing_files = []
+
+for label, path in INPUT_FILES.items():
+
+    if not path.exists():
+
+        missing_files.append(
+            f"{label}: {path}"
+        )
+
+
+if missing_files:
+
+    print()
+    print(
+        "Missing required input files:"
+    )
+
+    for item in missing_files:
+        print(
+            " -",
+            item
+        )
+
+    print()
+    print(
+        "Run the required uncertainty/OOD pipeline first."
+    )
+
+    raise FileNotFoundError(
+        "One or more required result files are missing."
+    )
+
+
+# ============================================================
+# LOAD RESULTS
+# ============================================================
+
+aurc_curve = pd.read_csv(
+    AURC_FILE
+)
+
+aurc_summary = pd.read_csv(
+    AURC_SUMMARY_FILE
+)
+
+significance = pd.read_csv(
+    OOD_SIG_FILE
+)
+
+fold_comparison = pd.read_csv(
+    OOD_FOLD_FILE
+)
+
+uncertainty_quartiles = pd.read_csv(
+    NESTED_QUARTILE_FILE
+)
+
+nested_summary = pd.read_csv(
+    NESTED_COVERAGE_FILE
+)
+
+selective_curve = pd.read_csv(
+    SELECTIVE_FILE
+)
+
+
+# ============================================================
+# HELPER
+# ============================================================
+
+def get_metric(
+    dataframe,
+    method,
+    column
+):
+
+    rows = dataframe[
+        dataframe["Method"] == method
+    ]
+
+    if rows.empty:
+        return np.nan
+
+    return float(
+        rows[column].iloc[0]
+    )
+
+
+def require_column(
+    dataframe,
+    column,
+    filename
+):
+
+    if column not in dataframe.columns:
+
+        raise ValueError(
+            f"Required column '{column}' "
+            f"not found in {filename}.\n"
+            f"Available columns: "
+            f"{dataframe.columns.tolist()}"
+        )
+
+
+# ============================================================
+# VALIDATE EXPECTED COLUMNS
+# ============================================================
+
+for column in [
+    "Coverage",
+    "OOD_MAE",
+    "Raw_Uncertainty_MAE",
+    "Calibrated_Uncertainty_MAE"
+]:
+
+    require_column(
+        aurc_curve,
+        column,
+        AURC_FILE.name
+    )
+
+
+for column in [
+    "Method",
+    "Mean_AURC",
+    "SD_AURC"
+]:
+
+    require_column(
+        aurc_summary,
+        column,
+        AURC_SUMMARY_FILE.name
+    )
+
+
+for column in [
+    "Comparison",
+    "Metric",
+    "OOD_Value",
+    "Uncertainty_Value",
+    "Difference",
+    "CI_Low",
+    "CI_High",
+    "Permutation_p"
+]:
+
+    require_column(
+        significance,
+        column,
+        OOD_SIG_FILE.name
+    )
+
+
+for column in [
+    "Fold",
+    "OOD_AUROC",
+    "Raw_Uncertainty_AUROC",
+    "Calibrated_Uncertainty_AUROC"
+]:
+
+    require_column(
+        fold_comparison,
+        column,
+        OOD_FOLD_FILE.name
+    )
+
+
+for column in [
+    "Calibrated_Uncertainty_Quartile",
+    "Mean_Calibrated_Sigma",
+    "Mean_Absolute_Error"
+]:
+
+    require_column(
+        uncertainty_quartiles,
+        column,
+        NESTED_QUARTILE_FILE.name
+    )
+
+
+for column in [
+    "Coverage",
+    "OOD_MAE",
+    "Raw_Uncertainty_MAE",
+    "Calibrated_Uncertainty_MAE"
+]:
+
+    require_column(
+        selective_curve,
+        column,
+        SELECTIVE_FILE.name
+    )
+
+
+# ============================================================
+# AURC VALUES
+# ============================================================
+
+ood_aurc = get_metric(
+    aurc_summary,
+    "OOD",
+    "Mean_AURC"
+)
+
+raw_aurc = get_metric(
+    aurc_summary,
+    "Raw_Uncertainty",
+    "Mean_AURC"
+)
+
+calibrated_aurc = get_metric(
+    aurc_summary,
+    "Calibrated_Uncertainty",
+    "Mean_AURC"
+)
+
+
+ood_aurc_sd = get_metric(
+    aurc_summary,
+    "OOD",
+    "SD_AURC"
+)
+
+raw_aurc_sd = get_metric(
+    aurc_summary,
+    "Raw_Uncertainty",
+    "SD_AURC"
+)
+
+calibrated_aurc_sd = get_metric(
+    aurc_summary,
+    "Calibrated_Uncertainty",
+    "SD_AURC"
+)
+
+
+raw_aurc_improvement = (
+    ood_aurc
+    -
+    raw_aurc
+)
+
+calibrated_aurc_improvement = (
+    ood_aurc
+    -
+    calibrated_aurc
+)
+
+
+raw_aurc_relative = (
+    raw_aurc_improvement
+    /
+    ood_aurc
+    *
+    100
+)
+
+calibrated_aurc_relative = (
+    calibrated_aurc_improvement
+    /
+    ood_aurc
+    *
+    100
+)
+
+
+# ============================================================
+# SIGNIFICANCE RESULTS
+# ============================================================
+
+raw_auc_row = significance[
+    (
+        significance["Comparison"]
+        ==
+        "Raw_Uncertainty_minus_OOD"
+    )
+    &
+    (
+        significance["Metric"]
+        ==
+        "AUROC"
+    )
+]
+
+raw_ap_row = significance[
+    (
+        significance["Comparison"]
+        ==
+        "Raw_Uncertainty_minus_OOD"
+    )
+    &
+    (
+        significance["Metric"]
+        ==
+        "AUPRC"
+    )
+]
+
+cal_auc_row = significance[
+    (
+        significance["Comparison"]
+        ==
+        "Calibrated_Uncertainty_minus_OOD"
+    )
+    &
+    (
+        significance["Metric"]
+        ==
+        "AUROC"
+    )
+]
+
+cal_ap_row = significance[
+    (
+        significance["Comparison"]
+        ==
+        "Calibrated_Uncertainty_minus_OOD"
+    )
+    &
+    (
+        significance["Metric"]
+        ==
+        "AUPRC"
+    )
+]
+
+
+for name, table in [
+    ("raw AUROC", raw_auc_row),
+    ("raw AUPRC", raw_ap_row),
+    ("calibrated AUROC", cal_auc_row),
+    ("calibrated AUPRC", cal_ap_row),
+]:
+
+    if table.empty:
+
+        raise ValueError(
+            f"Could not find {name} "
+            "comparison in significance file."
+        )
+
+
+raw_auc_row = raw_auc_row.iloc[0]
+raw_ap_row = raw_ap_row.iloc[0]
+cal_auc_row = cal_auc_row.iloc[0]
+cal_ap_row = cal_ap_row.iloc[0]
+
+
+# ============================================================
+# FOLD WIN COUNTS
+# ============================================================
+
+raw_auc_wins = int(
+    (
+        fold_comparison[
+            "Raw_Uncertainty_AUROC"
+        ]
+        >
+        fold_comparison[
+            "OOD_AUROC"
+        ]
+    ).sum()
+)
+
+cal_auc_wins = int(
+    (
+        fold_comparison[
+            "Calibrated_Uncertainty_AUROC"
+        ]
+        >
+        fold_comparison[
+            "OOD_AUROC"
+        ]
+    ).sum()
+)
+
+raw_ap_wins = int(
+    (
+        fold_comparison[
+            "Raw_Uncertainty_AUPRC"
+        ]
+        >
+        fold_comparison[
+            "OOD_AUPRC"
+        ]
+    ).sum()
+)
+
+cal_ap_wins = int(
+    (
+        fold_comparison[
+            "Calibrated_Uncertainty_AUPRC"
+        ]
+        >
+        fold_comparison[
+            "OOD_AUPRC"
+        ]
+    ).sum()
+)
+
+
+# ============================================================
+# FINAL DETECTOR TABLE
+# ============================================================
+
+final_detector_table = pd.DataFrame([
+
+    {
+        "Method":
+            "OOD",
+
+        "AUROC":
+            raw_auc_row["OOD_Value"],
+
+        "AUPRC":
+            raw_ap_row["OOD_Value"],
+
+        "AURC":
+            ood_aurc,
+
+        "AURC_SD":
+            ood_aurc_sd
+    },
+
+    {
+        "Method":
+            "Raw uncertainty",
+
+        "AUROC":
+            raw_auc_row[
+                "Uncertainty_Value"
+            ],
+
+        "AUPRC":
+            raw_ap_row[
+                "Uncertainty_Value"
+            ],
+
+        "AURC":
+            raw_aurc,
+
+        "AURC_SD":
+            raw_aurc_sd
+    },
+
+    {
+        "Method":
+            "Calibrated uncertainty",
+
+        "AUROC":
+            cal_auc_row[
+                "Uncertainty_Value"
+            ],
+
+        "AUPRC":
+            cal_ap_row[
+                "Uncertainty_Value"
+            ],
+
+        "AURC":
+            calibrated_aurc,
+
+        "AURC_SD":
+            calibrated_aurc_sd
+    }
+])
+
+
+# ============================================================
+# SELECTIVE RESULTS
+# ============================================================
+
+def get_coverage_row(
+    coverage
+):
+
+    rows = selective_curve[
+        np.isclose(
+            selective_curve[
+                "Coverage"
+            ],
+            coverage
+        )
+    ]
+
+    if rows.empty:
+
+        raise ValueError(
+            f"Coverage {coverage} "
+            "not found in selective results."
+        )
+
+    return rows.iloc[0]
+
+
+row_80 = get_coverage_row(
+    0.80
+)
+
+row_50 = get_coverage_row(
+    0.50
+)
+
+
+baseline_mae = (
+    selective_curve[
+        selective_curve["Coverage"] == 1.0
+    ][
+        "Raw_Uncertainty_MAE"
+    ]
+    .iloc[0]
+)
+
+
+# ============================================================
+# UNCERTAINTY QUARTILES
+# ============================================================
+
+quartile_labels = (
+    uncertainty_quartiles[
+        "Calibrated_Uncertainty_Quartile"
+    ]
+    .astype(str)
+    .to_list()
+)
+
+quartile_mae = (
+    uncertainty_quartiles[
+        "Mean_Absolute_Error"
+    ]
+    .to_numpy()
+)
+
+q1_mae = float(
+    quartile_mae[0]
+)
+
+q4_mae = float(
+    quartile_mae[-1]
+)
+
+q4_q1_degradation = (
+    (
+        q4_mae
+        -
+        q1_mae
+    )
+    /
+    q1_mae
+    *
+    100
+)
+
+
+# ============================================================
+# PRINT CORE RESULTS
+# ============================================================
+
+print()
+print("============================================================")
+print("FINAL DETECTOR COMPARISON")
+print("============================================================")
+
+print(
+    final_detector_table.to_string(
+        index=False
+    )
+)
+
+
+print()
+print("============================================================")
+print("SIGNIFICANCE")
+print("============================================================")
+
+print(
+    "Raw uncertainty vs OOD AUROC:"
+)
+
+print(
+    "Δ =",
+    round(
+        raw_auc_row["Difference"],
+        6
+    )
+)
+
+print(
+    "95% CI = [",
+    round(
+        raw_auc_row["CI_Low"],
+        6
+    ),
+    ",",
+    round(
+        raw_auc_row["CI_High"],
+        6
+    ),
+    "]"
+)
+
+print(
+    "Permutation p =",
+    raw_auc_row[
+        "Permutation_p"
+    ]
+)
+
+
+print()
+print(
+    "Raw uncertainty vs OOD AUPRC:"
+)
+
+print(
+    "Δ =",
+    round(
+        raw_ap_row["Difference"],
+        6
+    )
+)
+
+print(
+    "95% CI = [",
+    round(
+        raw_ap_row["CI_Low"],
+        6
+    ),
+    ",",
+    round(
+        raw_ap_row["CI_High"],
+        6
+    ),
+    "]"
+)
+
+print(
+    "Permutation p =",
+    raw_ap_row[
+        "Permutation_p"
+    ]
+)
+
+
+# ============================================================
+# PRINT SELECTIVE RESULTS
+# ============================================================
+
+print()
+print("============================================================")
+print("SELECTIVE PREDICTION")
+print("============================================================")
+
+print(
+    "Full-coverage MAE:",
+    round(
+        baseline_mae,
+        6
+    )
+)
+
+print()
+
+print(
+    "80% coverage:"
+)
+
+print(
+    "OOD MAE:",
+    round(
+        row_80[
+            "OOD_MAE"
+        ],
+        6
+    )
+)
+
+print(
+    "Raw uncertainty MAE:",
+    round(
+        row_80[
+            "Raw_Uncertainty_MAE"
+        ],
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty MAE:",
+    round(
+        row_80[
+            "Calibrated_Uncertainty_MAE"
+        ],
+        6
+    )
+)
+
+print()
+
+print(
+    "50% coverage:"
+)
+
+print(
+    "OOD MAE:",
+    round(
+        row_50[
+            "OOD_MAE"
+        ],
+        6
+    )
+)
+
+print(
+    "Raw uncertainty MAE:",
+    round(
+        row_50[
+            "Raw_Uncertainty_MAE"
+        ],
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty MAE:",
+    round(
+        row_50[
+            "Calibrated_Uncertainty_MAE"
+        ],
+        6
+    )
+)
+
+
+# ============================================================
+# PRINT AURC
+# ============================================================
+
+print()
+print("============================================================")
+print("AURC")
+print("============================================================")
+
+print(
+    "OOD:",
+    round(
+        ood_aurc,
+        6
+    )
+)
+
+print(
+    "Raw uncertainty:",
+    round(
+        raw_aurc,
+        6
+    )
+)
+
+print(
+    "Calibrated uncertainty:",
+    round(
+        calibrated_aurc,
+        6
+    )
+)
+
+print()
+
+print(
+    "Raw AURC improvement:",
+    round(
+        raw_aurc_improvement,
+        6
+    ),
+    "(",
+    round(
+        raw_aurc_relative,
+        3
+    ),
+    "%)"
+)
+
+print(
+    "Calibrated AURC improvement:",
+    round(
+        calibrated_aurc_improvement,
+        6
+    ),
+    "(",
+    round(
+        calibrated_aurc_relative,
+        3
+    ),
+    "%)"
+)
+
+
+# ============================================================
+# PRINT QUARTILES
+# ============================================================
+
+print()
+print("============================================================")
+print("UNCERTAINTY QUARTILE ERROR")
+print("============================================================")
+
+for label, mae in zip(
+    quartile_labels,
+    quartile_mae
+):
+
+    print(
+        label,
+        ":",
+        round(
+            float(mae),
+            6
+        )
+    )
+
+print(
+    "Q4/Q1 degradation:",
+    round(
+        q4_q1_degradation,
+        3
+    ),
+    "%"
+)
+
+
+# ============================================================
+# PRINT FOLD CONSISTENCY
+# ============================================================
+
+print()
+print("============================================================")
+print("FOLD CONSISTENCY")
+print("============================================================")
+
+print(
+    "Raw uncertainty AUROC wins:",
+    raw_auc_wins,
+    "/",
+    len(
+        fold_comparison
+    )
+)
+
+print(
+    "Calibrated uncertainty AUROC wins:",
+    cal_auc_wins,
+    "/",
+    len(
+        fold_comparison
+    )
+)
+
+print(
+    "Raw uncertainty AUPRC wins:",
+    raw_ap_wins,
+    "/",
+    len(
+        fold_comparison
+    )
+)
+
+print(
+    "Calibrated uncertainty AUPRC wins:",
+    cal_ap_wins,
+    "/",
+    len(
+        fold_comparison
+    )
+)
+
+
+# ============================================================
+# FIGURE 1: AUROC
+# ============================================================
+
+methods = [
+    "OOD",
+    "Raw uncertainty",
+    "Calibrated uncertainty"
+]
+
+auroc_values = (
+    final_detector_table[
+        "AUROC"
+    ]
+    .to_numpy()
+)
+
+
+fig, ax = plt.subplots(
+    figsize=(7, 5)
+)
+
+x = np.arange(
+    len(methods)
+)
+
+ax.bar(
+    x,
+    auroc_values
+)
+
+ax.set_xticks(
+    x
+)
+
+ax.set_xticklabels(
+    methods,
+    rotation=15,
+    ha="right"
+)
+
+ax.set_ylabel(
+    "AUROC"
+)
+
+ax.set_title(
+    "High-Error Detection Performance"
+)
+
+ax.set_ylim(
+    0.50,
+    max(
+        0.72,
+        auroc_values.max() + 0.05
+    )
+)
+
+ax.grid(
+    axis="y",
+    alpha=0.25
+)
+
+for i, value in enumerate(
+    auroc_values
+):
+
+    ax.text(
+        i,
+        value + 0.005,
+        f"{value:.3f}",
+        ha="center"
+    )
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_AUROC_Comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FIGURE 2: AUPRC
+# ============================================================
+
+auprc_values = (
+    final_detector_table[
+        "AUPRC"
+    ]
+    .to_numpy()
+)
+
+
+fig, ax = plt.subplots(
+    figsize=(7, 5)
+)
+
+ax.bar(
+    x,
+    auprc_values
+)
+
+ax.set_xticks(
+    x
+)
+
+ax.set_xticklabels(
+    methods,
+    rotation=15,
+    ha="right"
+)
+
+ax.set_ylabel(
+    "AUPRC"
+)
+
+ax.set_title(
+    "High-Error Detection: Precision-Recall"
+)
+
+ax.set_ylim(
+    0.20,
+    max(
+        0.38,
+        auprc_values.max() + 0.05
+    )
+)
+
+ax.grid(
+    axis="y",
+    alpha=0.25
+)
+
+for i, value in enumerate(
+    auprc_values
+):
+
+    ax.text(
+        i,
+        value + 0.004,
+        f"{value:.3f}",
+        ha="center"
+    )
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_AUPRC_Comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FIGURE 3: RISK-COVERAGE
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(8, 5)
+)
+
+ax.plot(
+    aurc_curve[
+        "Coverage"
+    ],
+    aurc_curve[
+        "OOD_MAE"
+    ],
+    marker="o",
+    label="OOD"
+)
+
+ax.plot(
+    aurc_curve[
+        "Coverage"
+    ],
+    aurc_curve[
+        "Raw_Uncertainty_MAE"
+    ],
+    marker="o",
+    label="Raw uncertainty"
+)
+
+ax.plot(
+    aurc_curve[
+        "Coverage"
+    ],
+    aurc_curve[
+        "Calibrated_Uncertainty_MAE"
+    ],
+    marker="o",
+    label="Calibrated uncertainty"
+)
+
+ax.set_xlabel(
+    "Coverage"
+)
+
+ax.set_ylabel(
+    "Selective MAE"
+)
+
+ax.set_title(
+    "Risk-Coverage Performance"
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+ax.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_Risk_Coverage.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FIGURE 4: FOLD-WISE AUROC
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(8, 5)
+)
+
+folds = (
+    fold_comparison[
+        "Fold"
+    ]
+    .to_numpy()
+)
+
+
+ax.plot(
+    folds,
+    fold_comparison[
+        "OOD_AUROC"
+    ],
+    marker="o",
+    label="OOD"
+)
+
+ax.plot(
+    folds,
+    fold_comparison[
+        "Raw_Uncertainty_AUROC"
+    ],
+    marker="o",
+    label="Raw uncertainty"
+)
+
+ax.plot(
+    folds,
+    fold_comparison[
+        "Calibrated_Uncertainty_AUROC"
+    ],
+    marker="o",
+    label="Calibrated uncertainty"
+)
+
+ax.set_xlabel(
+    "Spatial fold"
+)
+
+ax.set_ylabel(
+    "AUROC"
+)
+
+ax.set_title(
+    "Fold-wise High-Error Detection"
+)
+
+ax.set_xticks(
+    folds
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+ax.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_Foldwise_AUROC.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FIGURE 5: UNCERTAINTY VS ERROR
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(8, 5)
+)
+
+quartile_x = np.arange(
+    len(quartile_mae)
+)
+
+ax.plot(
+    quartile_x,
+    quartile_mae,
+    marker="o"
+)
+
+ax.set_xticks(
+    quartile_x
+)
+
+ax.set_xticklabels(
+    quartile_labels,
+    rotation=20,
+    ha="right"
+)
+
+ax.set_ylabel(
+    "Mean absolute error"
+)
+
+ax.set_title(
+    "Prediction Error Across "
+    "Calibrated-Uncertainty Quartiles"
+)
+
+ax.grid(
+    alpha=0.25
+)
+
+for i, value in enumerate(
+    quartile_mae
+):
+
+    ax.text(
+        i,
+        value + 0.02,
+        f"{value:.3f}",
+        ha="center"
+    )
+
+plt.tight_layout()
+
+plt.savefig(
+    FINAL_RESULTS_DIR
+    / "Figure_Uncertainty_Quartile_Error.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+
+# ============================================================
+# FINAL TABLES
+# ============================================================
+
+final_detector_table.to_csv(
+    FINAL_RESULTS_DIR
+    / "Table_Uncertainty_vs_OOD.csv",
+    index=False
+)
+
+significance.to_csv(
+    FINAL_RESULTS_DIR
+    / "Table_Detector_Significance.csv",
+    index=False
+)
+
+fold_comparison.to_csv(
+    FINAL_RESULTS_DIR
+    / "Table_Foldwise_Detector_Comparison.csv",
+    index=False
+)
+
+aurc_summary.to_csv(
+    FINAL_RESULTS_DIR
+    / "Table_AURC.csv",
+    index=False
+)
+
+
+# ============================================================
+# HEADLINE TEXT
+# ============================================================
+
+headline = f"""
+YCEO-UHI FINAL PAPER RESULTS
+============================
+
+Dataset:
+Observations = {len(aurc_curve) if False else '9790'}
+Spatial folds = {fold_comparison["Fold"].nunique()}
+
+POINT PREDICTION
+----------------
+R2   = 0.381290 ± 0.082030
+RMSE = 0.650130 ± 0.022128
+MAE  = 0.477012 ± 0.013569
+
+FAILURE DETECTION
+-----------------
+OOD AUROC:
+{raw_auc_row["OOD_Value"]:.6f}
+
+Raw uncertainty AUROC:
+{raw_auc_row["Uncertainty_Value"]:.6f}
+
+Calibrated uncertainty AUROC:
+{cal_auc_row["Uncertainty_Value"]:.6f}
+
+Raw uncertainty ΔAUROC:
+{raw_auc_row["Difference"]:.6f}
+
+Raw uncertainty AUROC 95% CI:
+[{raw_auc_row["CI_Low"]:.6f}, {raw_auc_row["CI_High"]:.6f}]
+
+Raw uncertainty AUROC permutation p:
+{raw_auc_row["Permutation_p"]}
+
+OOD AUPRC:
+{raw_ap_row["OOD_Value"]:.6f}
+
+Raw uncertainty AUPRC:
+{raw_ap_row["Uncertainty_Value"]:.6f}
+
+Calibrated uncertainty AUPRC:
+{cal_ap_row["Uncertainty_Value"]:.6f}
+
+Raw uncertainty ΔAUPRC:
+{raw_ap_row["Difference"]:.6f}
+
+Raw uncertainty AUPRC 95% CI:
+[{raw_ap_row["CI_Low"]:.6f}, {raw_ap_row["CI_High"]:.6f}]
+
+Raw uncertainty AUPRC permutation p:
+{raw_ap_row["Permutation_p"]}
+
+AURC
+----
+OOD:
+{ood_aurc:.6f} ± {ood_aurc_sd:.6f}
+
+Raw uncertainty:
+{raw_aurc:.6f} ± {raw_aurc_sd:.6f}
+
+Calibrated uncertainty:
+{calibrated_aurc:.6f} ± {calibrated_aurc_sd:.6f}
+
+Raw relative AURC improvement over OOD:
+{raw_aurc_relative:.3f}%
+
+Calibrated relative AURC improvement over OOD:
+{calibrated_aurc_relative:.3f}%
+
+SELECTIVE PREDICTION
+--------------------
+80% coverage:
+
+OOD MAE:
+{row_80["OOD_MAE"]:.6f}
+
+Raw uncertainty MAE:
+{row_80["Raw_Uncertainty_MAE"]:.6f}
+
+Calibrated uncertainty MAE:
+{row_80["Calibrated_Uncertainty_MAE"]:.6f}
+
+50% coverage:
+
+OOD MAE:
+{row_50["OOD_MAE"]:.6f}
+
+Raw uncertainty MAE:
+{row_50["Raw_Uncertainty_MAE"]:.6f}
+
+Calibrated uncertainty MAE:
+{row_50["Calibrated_Uncertainty_MAE"]:.6f}
+
+UNCERTAINTY QUARTILES
+---------------------
+Q1 MAE:
+{q1_mae:.6f}
+
+Q4 MAE:
+{q4_mae:.6f}
+
+Q4/Q1 MAE degradation:
+{q4_q1_degradation:.3f}%
+
+FOLD CONSISTENCY
+----------------
+Raw uncertainty AUROC wins:
+{raw_auc_wins}/{len(fold_comparison)}
+
+Calibrated uncertainty AUROC wins:
+{cal_auc_wins}/{len(fold_comparison)}
+
+Raw uncertainty AUPRC wins:
+{raw_ap_wins}/{len(fold_comparison)}
+
+Calibrated uncertainty AUPRC wins:
+{cal_ap_wins}/{len(fold_comparison)}
+"""
+
+
+with open(
+    FINAL_RESULTS_DIR
+    / "Final_Paper_Headline_Statistics.txt",
+    "w",
+    encoding="utf-8"
+) as f:
+
+    f.write(
+        headline.strip()
+    )
+
+
+# ============================================================
+# COMPLETION
+# ============================================================
+
+print()
+print("============================================================")
+print("FINAL PAPER ANALYSIS COMPLETE")
+print("============================================================")
+
+print(
+    "Output directory:",
+    FINAL_RESULTS_DIR
+)
+
+print()
+
+for file in sorted(
+    FINAL_RESULTS_DIR.iterdir()
+):
+
+    if file.is_file():
+
+        print(
+            file.name
+        )

@@ -1,0 +1,116 @@
+YCEO-UHI FINAL PAPER RESULTS
+============================
+
+Dataset:
+Observations = 9790
+Spatial folds = 5
+
+POINT PREDICTION
+----------------
+R2   = 0.381290 ± 0.082030
+RMSE = 0.650130 ± 0.022128
+MAE  = 0.477012 ± 0.013569
+
+FAILURE DETECTION
+-----------------
+OOD AUROC:
+0.617782
+
+Raw uncertainty AUROC:
+0.667757
+
+Calibrated uncertainty AUROC:
+0.667909
+
+Raw uncertainty ΔAUROC:
+0.049975
+
+Raw uncertainty AUROC 95% CI:
+[0.035811, 0.064417]
+
+Raw uncertainty AUROC permutation p:
+0.0002
+
+OOD AUPRC:
+0.277565
+
+Raw uncertainty AUPRC:
+0.331630
+
+Calibrated uncertainty AUPRC:
+0.330482
+
+Raw uncertainty ΔAUPRC:
+0.054064
+
+Raw uncertainty AUPRC 95% CI:
+[0.037465, 0.070619]
+
+Raw uncertainty AUPRC permutation p:
+0.0
+
+AURC
+----
+OOD:
+0.413949 ± 0.022535
+
+Raw uncertainty:
+0.384296 ± 0.021978
+
+Calibrated uncertainty:
+0.385217 ± 0.022725
+
+Raw relative AURC improvement over OOD:
+7.163%
+
+Calibrated relative AURC improvement over OOD:
+6.941%
+
+SELECTIVE PREDICTION
+--------------------
+80% coverage:
+
+OOD MAE:
+0.440396
+
+Raw uncertainty MAE:
+0.423097
+
+Calibrated uncertainty MAE:
+0.423298
+
+50% coverage:
+
+OOD MAE:
+0.407567
+
+Raw uncertainty MAE:
+0.383240
+
+Calibrated uncertainty MAE:
+0.383495
+
+UNCERTAINTY QUARTILES
+---------------------
+Q1 MAE:
+0.349026
+
+Q4 MAE:
+0.670105
+
+Q4/Q1 MAE degradation:
+91.993%
+
+FOLD CONSISTENCY
+----------------
+Raw uncertainty AUROC wins:
+5/5
+
+Calibrated uncertainty AUROC wins:
+5/5
+
+Raw uncertainty AUPRC wins:
+5/5
+
+Calibrated uncertainty AUPRC wins:
+5/5

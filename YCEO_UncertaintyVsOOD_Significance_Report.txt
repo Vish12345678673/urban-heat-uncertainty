@@ -1,0 +1,33 @@
+UNCERTAINTY VS OOD SIGNIFICANCE ANALYSIS
+
+Observations: 9790
+High-error threshold: 0.737677
+High-error prevalence: 20.000%
+
+OOD AUROC: 0.617782
+Raw uncertainty AUROC: 0.667757
+Calibrated uncertainty AUROC: 0.667909
+
+Raw uncertainty ΔAUROC: 0.049975
+Raw uncertainty AUROC CI: [0.035811, 0.064417]
+Raw uncertainty AUROC permutation p: 0.000200
+
+Calibrated uncertainty ΔAUROC: 0.050127
+Calibrated uncertainty AUROC CI: [0.035956, 0.064491]
+Calibrated uncertainty AUROC permutation p: 0.000200
+
+OOD AUPRC: 0.277565
+Raw uncertainty AUPRC: 0.331630
+Calibrated uncertainty AUPRC: 0.330482
+
+Raw uncertainty ΔAUPRC: 0.054064
+Raw uncertainty AUPRC CI: [0.037465, 0.070619]
+Raw uncertainty AUPRC permutation p: 0.000000
+
+Calibrated uncertainty ΔAUPRC: 0.052917
+Calibrated uncertainty AUPRC CI: [0.036416, 0.069145]
+Calibrated uncertainty AUPRC permutation p: 0.000000
+
+OOD Spearman: 0.149939
+Raw uncertainty Spearman: 0.232349
+Calibrated uncertainty Spearman: 0.232165
